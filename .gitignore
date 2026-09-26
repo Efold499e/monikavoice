@@ -1,0 +1,20 @@
+# 识别模型（约 1 GB，见 README 安装步骤下载）
+sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/
+sherpa-onnx-paraformer-zh-2023-09-14/
+sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12/
+
+# 同音替换资源（hr-files 发行包，见 README 下载；dict 14 MB 不入库）
+hr/dict/
+hr/lexicon.txt
+
+# 原图过大，仓库只保留 64px 托盘图标
+icon.png
+
+# v1 时代产物与下载残骸
+VoiceInput.cs
+VoiceInput.exe
+*.tar.bz2
+
+# 运行产物（含语音识别内容，禁止入库）
+*.log
+__pycache__/
