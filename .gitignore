@@ -15,7 +15,10 @@ VoiceInput.cs
 VoiceInput.exe
 *.tar.bz2
 
-# 运行产物（含语音识别内容，禁止入库）
+# 运行产物（含语音识别内容与密钥，禁止入库）
 *.log
 history.jsonl
+config.json
+logs/
+summaries/
 __pycache__/

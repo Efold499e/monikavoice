@@ -18,17 +18,26 @@ Windows 离线中文语音听写工具：按热键说话，文字自动打进当
 ## 工作原理
 
 ```
-麦克风(16k) ──► 流式 zipformer ──► 浮窗实时跟随
+麦克风(16k，常态录音) ──► 流式 zipformer ──► 浮窗实时跟随（仅上屏模式）
                    │ 停顿 0.4s 断句
                    ▼
+     ┌─ 记录模式(默认) ─► 按天日志 logs/voice-日期.log（不上屏）
+     │
+     └─ 上屏模式(唤出后)
+              ▼
         离线 Paraformer 重识别
-                   ▼
+              ▼
         同音替换器纠错（jieba + replace.fst）
-                   ▼
+              ▼
         ct-transformer 自动标点
-                   ▼
+              ▼
         SendInput(UNICODE) 打进当前输入框
 ```
+
+- 切换模式（热键/托盘/接口）瞬间的半句会被截断、只进日志不上屏。
+- 每天 02:00 用 DeepSeek 总结前一天 02:01 起的全部内容到 `summaries/日期.md`；
+  同时清理 6 个月前的语音日志与历史。电脑 2 点关机错过时，开机后自动补跑。
+  API key 等配置在 `config.json`（不入库），模型名默认 `deepseek-chat`。
 
 ## 基于的开源项目
 
@@ -102,10 +111,16 @@ Windows 离线中文语音听写工具：按热键说话，文字自动打进当
 | 接口 | 说明 |
 |------|------|
 | `GET /api/history?limit=100&since_id=0` | 按新到旧返回记录，`since_id` 用于增量拉取 |
-| `GET /api/status` | 返回 `{running, hotkey, total}` |
+| `GET /api/status` | 返回 `{running, mode, hotkey, total}` |
+| `GET /api/summary?date=YYYY-MM-DD` | 取某天的 DeepSeek 总结（`/api/summaries` 列出全部日期） |
+| `POST /api/mode` | `{"mode":"commit"/"ambient"}` 或 `{"toggle":true}` 切换上屏/记录 |
+| `POST /api/summarize` | `{"date":"YYYY-MM-DD"}` 立即生成某天总结 |
+| `POST /api/transcribe` | `{"path":"D:\\x.wav","log":true}` 转写音频文件（宿曜整理上课录音预留） |
 | `POST /api/clear` | 清空历史（内存与 history.jsonl） |
 
-记录同时追加写入 `monikavoice.py` 同目录的 `history.jsonl`（每行一条 JSON），重启后自动载入尾部继续。`history.jsonl` 含语音内容，已在 `.gitignore` 中排除。
+服务只监听 `127.0.0.1`；在 `config.json` 配置 `api_token` 后，所有 POST 需带 `X-Token` 头。配套的 AI 调用说明见 `~/.agents/monikavoice/SKILL.md`。
+
+记录同时追加写入 `monikavoice.py` 同目录的 `history.jsonl`（每行一条 JSON），重启后自动载入尾部继续；语音原文按天写入 `logs/voice-YYYY-MM-DD.log`。`history.jsonl`、`logs/`、`config.json` 均含隐私内容，已在 `.gitignore` 中排除。
 
 ## 已知限制
 

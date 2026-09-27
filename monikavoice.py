@@ -2,30 +2,35 @@
 """
 monikavoice —— Windows 离线中文语音听写（本地运行，无广告，不联网）
 
-- Alt+R 开关听写（若被 NVIDIA 等程序占用则自动退回 Alt+T / Alt+W，浮窗会显示当前热键）
-- Ctrl+Alt+Q 退出（被占用时可用托盘右键菜单退出）
-- 听写时弹出置顶小浮窗，实时显示识别内容；停止后浮窗隐藏
-- 双模型管线：流式 zipformer 实时跟随显示；断句后由离线 Paraformer +
-  同音替换器（jieba）整句精修纠正同音错别字，再经 ct-transformer 加标点，
-  最后以 Unicode 按键打进当前焦点输入框
-- 托盘图标常驻：左键开关听写，右键菜单
-- 历史记录：全部识别内容（含未上屏的）写入 history.jsonl，浏览器打开
-  http://127.0.0.1:8397/ 查看；/api/history 等接口供其他程序调用
+- 常态录音：程序运行即持续监听麦克风，所有说到的话按时间写入 logs/voice-日期.log
+  与 history.jsonl（记录模式，不上屏）
+- 唤出上屏：Alt+R/Alt+T（被占用自动回退）切换到上屏模式，切换瞬间会把正在录的
+  半句截断、只上 log 不上屏；之后断句的内容经"离线 Paraformer 精修 + 同音替换
+  纠错 + ct-transformer 标点"打进当前焦点输入框；再次按热键收回记录模式
+- 实时浮窗：仅上屏模式弹出，流式跟随识别内容，不抢目标应用焦点
+- 历史与 API：http://127.0.0.1:8397/ 网页查看；/api/history /api/status
+  /api/mode /api/transcribe（预留宿曜整理上课录音）等接口供 AI/程序调用
+- 每日任务：02:00 用 DeepSeek 总结前一天 02:01 起的全部内容到 summaries/；
+  同时清理 6 个月前的历史与日志
 """
 import ctypes
 import ctypes.wintypes as wt
 import glob
 import json
+import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
 import tkinter as tk
 import webbrowser
 from collections import deque
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+from urllib import request as urlrequest
 
 import numpy as np
 import sherpa_onnx
@@ -48,12 +53,72 @@ MODEL_DIR = os.path.join(BASE, "sherpa-onnx-streaming-zipformer-bilingual-zh-en-
 PUNCT_DIR = os.path.join(BASE, "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12")
 PARAFORMER_DIR = os.path.join(BASE, "sherpa-onnx-paraformer-zh-2023-09-14")
 HR_DIR = os.path.join(BASE, "hr")
+LOGS_DIR = os.path.join(BASE, "logs")
+SUMMARIES_DIR = os.path.join(BASE, "summaries")
 LOG_PATH = os.path.join(BASE, "monikavoice.log")
-ICON64 = os.path.join(BASE, "icon64.png")
 HISTORY_PATH = os.path.join(BASE, "history.jsonl")
+CONFIG_PATH = os.path.join(BASE, "config.json")
+ICON64 = os.path.join(BASE, "icon64.png")
 HTTP_PORT = 8397
-HISTORY_MAX = 1000  # 内存与文件各自保留的最大条数
+HISTORY_MAX = 2000
+RETAIN_DAYS = 183  # 六个月
 
+# 固定的 DeepSeek 开放接口：协议与主机白名单硬编码，请求前再校验一次
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_API_HOSTS = {"api.deepseek.com"}
+
+DEFAULT_CONFIG = {
+    "deepseek_api_key": "",
+    "deepseek_model": "deepseek-chat",
+    "summary_hour": 2,
+    "api_token": "",
+}
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def log(*args):
+    line = " ".join(str(a) for a in args)
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("[%m-%d %H:%M:%S] ") + line + "\n")
+    except OSError:
+        pass
+
+
+def voice_log(text, committed):
+    """语音内容按天落盘：logs/voice-YYYY-MM-DD.log，每行 [时间] 标记 文本"""
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        name = os.path.basename("voice-" + time.strftime("%Y-%m-%d") + ".log")
+        with open(os.path.join(LOGS_DIR, name), "a", encoding="utf-8") as f:
+            f.write(time.strftime("[%H:%M:%S] ") + ("上屏 " if committed else "记录 ") + text + "\n")
+    except OSError as exc:
+        log("语音日志写入失败:", exc)
+
+
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def valid_date(s):
+    """严格校验 YYYY-MM-DD，防止路径拼接注入"""
+    if not DATE_RE.match(s or ""):
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+# ---------------- 历史存储 ----------------
 
 class HistoryStore:
     """识别历史：内存 deque + JSONL 追加落盘，重启后载入尾部继续"""
@@ -88,7 +153,7 @@ class HistoryStore:
         entry = {
             "id": self.next_id,
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "type": kind,          # final=断句上屏, dropped=录到但未上屏
+            "type": kind,          # final=上屏, flush=切换截断, ambient=常态记录, transcribe=文件转写
             "committed": bool(committed),
             "refined": bool(refined),
             "text": text,
@@ -116,15 +181,14 @@ class HistoryStore:
             except OSError:
                 pass
 
+    def reload(self):
+        with self.lock:
+            self.items.clear()
+        self.next_id = 1
+        self._load_tail()
 
-def log(*args):
-    line = " ".join(str(a) for a in args)
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(time.strftime("[%m-%d %H:%M:%S] ") + line + "\n")
-    except OSError:
-        pass
 
+# ---------------- 打字 ----------------
 
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
@@ -186,6 +250,8 @@ def send_text(text):
             log("[SendInput 只成功]", sent, "/", len(group))
         time.sleep(0.005)
 
+
+# ---------------- 模型加载 ----------------
 
 def build_recognizer():
     files = {}
@@ -255,120 +321,252 @@ def load_punctuation():
         return None
 
 
-PAGE_HTML = """<!doctype html>
-<html lang="zh"><head><meta charset="utf-8">
-<title>monikavoice 历史记录</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
- body{background:#141416;color:#e8eaed;font-family:"Microsoft YaHei UI",sans-serif;margin:0;padding:24px}
- h1{font-size:18px;font-weight:600;margin:0 0 4px}
- .sub{color:#9aa0a6;font-size:12px;margin-bottom:16px}
- .item{background:#1f1f23;border-radius:8px;padding:10px 14px;margin-bottom:8px}
- .meta{font-size:11px;color:#9aa0a6;margin-bottom:4px}
- .badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;margin-right:8px}
- .committed{background:#1e3a29;color:#81c995}
- .dropped{background:#3a2e1e;color:#fdd663}
- .text{font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
- #empty{color:#9aa0a6;text-align:center;padding:40px 0}
- .api{color:#9aa0a6;font-size:12px;margin-top:18px;line-height:1.8}
- code{background:#1f1f23;padding:1px 6px;border-radius:4px}
-</style></head><body>
-<h1>monikavoice 历史记录</h1>
-<div class="sub" id="status">加载中…</div>
-<div id="list"></div>
-<div class="api">
- API：<code>GET /api/history?limit=100&amp;since_id=0</code> ·
- <code>GET /api/status</code> · <code>POST /api/clear</code>（仅本机 127.0.0.1 可访问）
-</div>
-<script>
-let lastId = 0;
-async function load(){
-  try{
-    const r = await fetch('/api/history?limit=200');
-    const d = await r.json();
-    const list = document.getElementById('list');
-    if(!d.items.length){ list.innerHTML = '<div id="empty">还没有记录</div>'; }
-    else{
-      list.innerHTML = d.items.map(e =>
-        `<div class="item"><div class="meta">` +
-        `<span class="badge ${e.committed?'committed':'dropped'}">${e.committed?'已上屏':'未上屏'}</span>` +
-        `#${e.id} · ${e.ts}${e.refined?' · 已精修':''}</div>` +
-        `<div class="text"></div></div>`).join('');
-      list.querySelectorAll('.text').forEach((el,i)=>{ el.textContent = d.items[i].text; });
-    }
-    const s = await (await fetch('/api/status')).json();
-    document.getElementById('status').textContent =
-      `状态：${s.running?'听写中':'待命'} · 开关热键 ${s.hotkey||'无（用托盘图标）'} · 共 ${s.total} 条 · 每 3 秒自动刷新`;
-  }catch(e){}
-}
-load(); setInterval(load, 3000);
-</script></body></html>"""
+# ---------------- 文件转写（宿曜预留） ----------------
+
+def safe_media_path(path):
+    """转写文件路径校验：真实路径、必须是 .wav、禁止系统目录"""
+    if not path or not os.path.isabs(path):
+        raise ValueError("需要绝对路径")
+    p = os.path.realpath(os.path.abspath(path))
+    if not p.lower().endswith(".wav"):
+        raise ValueError("仅支持 .wav 文件")
+    if not os.path.isfile(p):
+        raise ValueError("文件不存在")
+    blocked_roots = [os.environ.get("WINDIR", r"C:\Windows"),
+                     os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")]
+    for root in blocked_roots:
+        if root and p.lower().startswith(os.path.realpath(root).lower() + os.sep):
+            raise ValueError("不允许访问系统目录")
+    return p
 
 
-class HistoryServer:
-    """仅绑定 127.0.0.1 的历史查询接口与页面"""
+def _read_wav_mono16k(path):
+    """读 wav（PCM 8/16/32bit），混单声道、线性重采样到 16k。不依赖 scipy"""
+    import wave
+    w = wave.open(path, "rb")
+    try:
+        nch, sw, sr, nf = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+        raw = w.readframes(nf)
+    finally:
+        w.close()
+    if sw == 2:
+        data = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sw == 1:
+        data = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif sw == 4:
+        data = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError("不支持的位宽: %d 字节（支持 8/16/32bit PCM）" % sw)
+    if nch > 1:
+        data = data.reshape(-1, nch).mean(axis=1)
+    if sr != SAMPLE_RATE and len(data) > 1:
+        x_old = np.arange(len(data), dtype=np.float64)
+        n_new = int(round(len(data) * SAMPLE_RATE / sr))
+        x_new = np.linspace(0.0, len(data) - 1, n_new)
+        data = np.interp(x_new, x_old, data).astype(np.float32)
+    return data
 
-    def __init__(self, store, state, hotkeys):
-        self.store = store
-        self.state = state
-        self.hotkeys = hotkeys
 
-        class Handler(BaseHTTPRequestHandler):
-            def _send(self, code, body, ctype):
-                data = body.encode("utf-8")
-                self.send_response(code)
-                self.send_header("Content-Type", ctype + "; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-            def do_GET(self):
-                u = urlparse(self.path)
-                if u.path == "/":
-                    self._send(200, PAGE_HTML, "text/html")
-                elif u.path == "/api/history":
-                    q = parse_qs(u.query)
-                    limit = int(q.get("limit", ["100"])[0])
-                    since = int(q.get("since_id", ["0"])[0])
-                    rows = store.query(limit=limit, since_id=since)
-                    self._send(200, json.dumps(
-                        {"items": rows, "last_id": rows[0]["id"] if rows else since},
-                        ensure_ascii=False), "application/json")
-                elif u.path == "/api/status":
-                    with store.lock:
-                        total = len(store.items)
-                    self._send(200, json.dumps({
-                        "running": state["running"],
-                        "hotkey": hotkeys.get("name"),
-                        "total": total,
-                    }, ensure_ascii=False), "application/json")
-                else:
-                    self._send(404, "not found", "text/plain")
-
-            def do_POST(self):
-                if urlparse(self.path).path == "/api/clear":
-                    store.clear()
-                    self._send(200, json.dumps({"ok": True}), "application/json")
-                else:
-                    self._send(404, "not found", "text/plain")
-
-            def log_message(self, *args):  # 静默 access log
+def transcribe_file(path, refiner, punct):
+    """转写音频文件：自动混单声道/重采样到 16k，30 秒分段走
+    Paraformer + 同音替换 + 标点，返回拼接文本"""
+    if refiner is None:
+        raise RuntimeError("离线精修模型未加载")
+    data = _read_wav_mono16k(path)
+    step = SAMPLE_RATE * 30
+    texts = []
+    for i in range(0, max(1, len(data)), step):
+        seg = data[i:i + step]
+        if len(seg) < SAMPLE_RATE // 10:
+            break
+        rs = refiner.create_stream()
+        rs.accept_waveform(SAMPLE_RATE, np.asarray(seg, dtype=np.float32))
+        refiner.decode_stream(rs)
+        t = rs.result.text.strip()
+        if t and punct is not None:
+            try:
+                t = punct.add_punctuation(t)
+            except Exception:
                 pass
+        if t:
+            texts.append(t)
+    return "".join(texts)
 
-        self.Handler = Handler
 
-    def start(self):
+# ---------------- 每日任务：DeepSeek 总结 + 六个月清理 ----------------
+
+LINE_RE = re.compile(r"\[(\d\d:\d\d:\d\d)\] (.*)$")
+
+
+def voice_log_path(date):
+    """某天的语音日志文件名（basename 消化任何路径成分）"""
+    return os.path.join(LOGS_DIR, os.path.basename("voice-" + date.strftime("%Y-%m-%d") + ".log"))
+
+
+def collect_window(start_dt, end_dt):
+    """收集 [start_dt, end_dt] 内的语音日志行"""
+    lines = []
+    d = start_dt.date()
+    while d <= end_dt.date():
+        p = voice_log_path(d)
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        m = LINE_RE.match(line.rstrip("\n"))
+                        if not m:
+                            continue
+                        t = datetime.combine(d, datetime.strptime(m.group(1), "%H:%M:%S").time())
+                        if start_dt <= t <= end_dt:
+                            lines.append("[" + d.strftime("%m-%d ") + m.group(1) + "] " + m.group(2))
+            except OSError:
+                pass
+        d += timedelta(days=1)
+    return lines
+
+
+def _guarded_urlopen(req, timeout):
+    """外发请求守卫：仅允许白名单域名的 https 请求"""
+    u = urlparse(req.full_url)
+    if u.scheme != "https" or u.hostname not in DEEPSEEK_API_HOSTS:
+        raise ValueError("blocked api host: " + str(u.hostname))
+    return urlrequest.urlopen(req, timeout=timeout)
+
+
+def deepseek_summarize(cfg, range_label, transcript):
+    body = json.dumps({
+        "model": cfg.get("deepseek_model", "deepseek-chat"),
+        "messages": [
+            {"role": "system", "content":
+                "你是个人语音日志整理助手。输入是用户通过语音听写记录的原始内容，"
+                "可能混有环境杂音误识别的碎片。请：1) 忽略无意义碎片、重复和杂音；"
+                "2) 把有意义的内容按主题分组，每组给出小标题和要点；"
+                "3) 明显的待办事项单独列出；4) 简体中文，600 字以内。"},
+            {"role": "user", "content": "时间范围：" + range_label + "\n语音内容：\n" + transcript},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 2000,
+    }, ensure_ascii=False).encode("utf-8")
+    req = urlrequest.Request(
+        DEEPSEEK_API_URL, data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + cfg.get("deepseek_api_key", "")})
+    with _guarded_urlopen(req, timeout=180) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"]
+
+
+def summarize_for_date(date_str, cfg, store):
+    """总结 date_str 当天 summary_hour+1 分到次日 summary_hour 点的内容"""
+    day = valid_date(date_str)
+    if day is None:
+        raise ValueError("非法日期: " + str(date_str))
+    hour = int(cfg.get("summary_hour", 2))
+    start_dt = datetime(day.year, day.month, day.day, hour) + timedelta(minutes=1)
+    end_dt = start_dt + timedelta(days=1) - timedelta(minutes=1)
+    lines = collect_window(start_dt, end_dt)
+    os.makedirs(SUMMARIES_DIR, exist_ok=True)
+    out_path = os.path.join(SUMMARIES_DIR, os.path.basename(date_str + ".md"))
+    if not lines:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("# " + date_str + " 语音日志总结\n\n（该时段无记录）\n")
+        return out_path
+    transcript = "\n".join(lines)
+    if len(transcript) > 24000:
+        transcript = "…（更早内容已截断）\n" + transcript[-24000:]
+    range_label = start_dt.strftime("%Y-%m-%d %H:%M") + " 至 " + end_dt.strftime("%Y-%m-%d %H:%M")
+    try:
+        text = deepseek_summarize(cfg, range_label, transcript)
+    except Exception as exc:
+        log("[每日总结] DeepSeek 调用失败:", exc)
+        text = "> 总结失败：" + str(exc) + "\n\n原始条数：" + str(len(lines))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("# " + date_str + " 语音日志总结\n\n范围：" + range_label +
+                " · 共 " + str(len(lines)) + " 条\n\n" + text + "\n")
+    log("[每日总结] 已写入", out_path)
+    return out_path
+
+
+def cleanup_old(days=RETAIN_DAYS, store=None):
+    """删除六个月前的语音日志与历史条目"""
+    cutoff = datetime.now() - timedelta(days=days)
+    n_logs = 0
+    if os.path.isdir(LOGS_DIR):
+        for p in glob.glob(os.path.join(LOGS_DIR, "voice-*.log")):
+            m = re.search(r"(\d{4}-\d{2}-\d{2})\.log$", p)
+            if m and datetime.strptime(m.group(1), "%Y-%m-%d") < cutoff:
+                try:
+                    os.remove(p)
+                    n_logs += 1
+                except OSError:
+                    pass
+    n_hist = 0
+    if os.path.isfile(HISTORY_PATH):
+        kept = []
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), self.Handler)
+            with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        e = json.loads(line.strip())
+                        if datetime.strptime(e.get("ts", ""), "%Y-%m-%d %H:%M:%S") < cutoff:
+                            n_hist += 1
+                            continue
+                        kept.append(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+            tmp = HISTORY_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(kept)
+            os.replace(tmp, HISTORY_PATH)
         except OSError as exc:
-            log(f"历史页面端口 {HTTP_PORT} 被占用，接口与页面停用:", exc)
-            return
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        log(f"历史页面: http://127.0.0.1:{HTTP_PORT}/")
+            log("历史清理失败:", exc)
+    if store is not None:
+        store.reload()
+    log("[清理] 删除", days, "天前日志", n_logs, "个、历史", n_hist, "条")
 
+
+def daily_worker(cfg, store):
+    """每天 summary_hour 点：总结昨天 + 清理旧数据"""
+    hour = int(cfg.get("summary_hour", 2))
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        wait = (target - now).total_seconds()
+        log("[每日任务] 下次运行:", target.strftime("%Y-%m-%d %H:%M"))
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            summarize_for_date(yesterday, cfg, store)
+        except Exception as exc:
+            log("[每日任务] 总结异常:", exc)
+        try:
+            cleanup_old(store=store)
+        except Exception as exc:
+            log("[每日任务] 清理异常:", exc)
+        time.sleep(60)
+
+
+def catchup_worker(cfg, store):
+    """开机补跑：昨天的总结缺失则补一次（电脑 2 点关机的情况）"""
+    time.sleep(90)
+    if not cfg.get("deepseek_api_key"):
+        return
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if not os.path.isfile(os.path.join(SUMMARIES_DIR, os.path.basename(yesterday + ".md"))):
+        try:
+            summarize_for_date(yesterday, cfg, store)
+        except Exception as exc:
+            log("[补跑总结] 失败:", exc)
+
+
+# ---------------- 浮窗 ----------------
 
 class FloatWindow:
-    """听写时弹出的置顶小浮窗：实时显示识别内容，不抢目标应用焦点"""
+    """上屏模式弹出的置顶小浮窗：实时显示识别内容，不抢目标应用焦点"""
 
     def __init__(self, ui_q, state, audio_q):
         self.q = ui_q
@@ -376,12 +574,13 @@ class FloatWindow:
         self.audio_q = audio_q
         self.hotkey_name = "…"
         self.last_partial = ""
+        self.tray = None
 
         self.root = tk.Tk()
-        self.root.title("语音听写")
+        self.root.title("monikavoice")
         self.root.configure(bg="#1f1f23")
         self.root.attributes("-topmost", True)
-        self.root.withdraw()  # 初始隐藏，听写开启时才弹出
+        self.root.withdraw()  # 常态隐藏，仅上屏模式弹出
 
         w, h = 380, 150
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -410,8 +609,8 @@ class FloatWindow:
         try:
             while True:
                 cmd, payload = self.q.get_nowait()
-                if cmd == "toggle":
-                    self.on_toggle()
+                if cmd == "mode":
+                    self.set_mode(payload)
                 elif cmd == "partial":
                     self.show_partial(payload)
                 elif cmd == "final":
@@ -420,17 +619,20 @@ class FloatWindow:
                     self.hotkey_name = payload or "无"
                     self.refresh_header()
                 elif cmd == "quit":
-                    # 先停听写，给识别线程约 1 秒把未上屏内容落历史，再退出
-                    self.state["running"] = False
+                    # 停止前让识别线程把未上屏内容截断上 log，约 1 秒后退出
+                    self.state["flush"].set()
                     self.root.after(1000, self.root.destroy)
                     return
         except queue.Empty:
             pass
         self.root.after(50, self.poll)
 
-    def on_toggle(self):
-        self.state["running"] = not self.state["running"]
-        if self.state["running"]:
+    def set_mode(self, mode):
+        if mode == "toggle":
+            mode = "ambient" if self.state["mode"] == "commit" else "commit"
+        self.state["mode"] = mode
+        self.state["flush"].set()  # 模式切换瞬间：截断半句，只上 log 不上屏
+        if mode == "commit":
             with self.audio_q.mutex:
                 self.audio_q.queue.clear()
             self.final_lbl.config(text="")
@@ -439,18 +641,25 @@ class FloatWindow:
             hwnd = user32.GetForegroundWindow()
             self.root.deiconify()
             self.root.lift()
-            # 弹窗不抢目标应用的键盘焦点
             self.root.after(120, lambda: user32.SetForegroundWindow(hwnd))
-            log("[听写 开]")
+            log("[模式] 上屏")
         else:
             self.root.withdraw()
-            log("[听写 关]")
+            log("[模式] 记录（不上屏）")
+        self.update_tray_title()
+
+    def update_tray_title(self):
+        try:
+            if self.tray is not None:
+                self.tray.title = "monikavoice（" + ("上屏模式" if self.state["mode"] == "commit" else "记录中") + "）"
+        except Exception:
+            pass
 
     def refresh_header(self):
-        if self.state["running"]:
-            self.header.config(text=f"● 听写中 · {self.hotkey_name} 停止", fg="#81c995")
+        if self.state["mode"] == "commit":
+            self.header.config(text="● 上屏模式 · " + self.hotkey_name + " 收起", fg="#81c995")
         else:
-            self.header.config(text="○ 已暂停", fg="#9aa0a6")
+            self.header.config(text="○ 记录中", fg="#9aa0a6")
 
     def show_partial(self, text):
         if text != self.last_partial:
@@ -464,21 +673,208 @@ class FloatWindow:
         self.partial_lbl.config(text="（说话中…）")
 
 
+# ---------------- 本机 HTTP 服务（页面 + API，宿曜接口预留） ----------------
+
+PAGE_HTML = """<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<title>monikavoice 历史记录</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+ body{background:#141416;color:#e8eaed;font-family:"Microsoft YaHei UI",sans-serif;margin:0;padding:24px}
+ h1{font-size:18px;font-weight:600;margin:0 0 4px}
+ .sub{color:#9aa0a6;font-size:12px;margin-bottom:16px}
+ .item{background:#1f1f23;border-radius:8px;padding:10px 14px;margin-bottom:8px}
+ .meta{font-size:11px;color:#9aa0a6;margin-bottom:4px}
+ .badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;margin-right:8px}
+ .committed{background:#1e3a29;color:#81c995}
+ .dropped{background:#3a2e1e;color:#fdd663}
+ .text{font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+ #empty{color:#9aa0a6;text-align:center;padding:40px 0}
+ .api{color:#9aa0a6;font-size:12px;margin-top:18px;line-height:1.8}
+ code{background:#1f1f23;padding:1px 6px;border-radius:4px}
+</style></head><body>
+<h1>monikavoice 历史记录</h1>
+<div class="sub" id="status">加载中…</div>
+<div id="list"></div>
+<div class="api">
+ API：<code>GET /api/history?limit=100&amp;since_id=0</code> ·
+ <code>GET /api/status</code> · <code>GET /api/summary?date=YYYY-MM-DD</code> ·
+ <code>POST /api/mode /api/clear /api/summarize /api/transcribe</code>
+ （仅本机 127.0.0.1 可访问；配置 api_token 后 POST 需带 X-Token 头）
+</div>
+<script>
+async function load(){
+  try{
+    const r = await fetch('/api/history?limit=200');
+    const d = await r.json();
+    const list = document.getElementById('list');
+    if(!d.items.length){ list.innerHTML = '<div id="empty">还没有记录</div>'; }
+    else{
+      list.innerHTML = d.items.map(e =>
+        `<div class="item"><div class="meta">` +
+        `<span class="badge ${e.committed?'committed':'dropped'}">${e.committed?'已上屏':'未上屏'}</span>` +
+        `#${e.id} · ${e.ts} · ${e.type}${e.refined?' · 已精修':''}</div>` +
+        `<div class="text"></div></div>`).join('');
+      list.querySelectorAll('.text').forEach((el,i)=>{ el.textContent = d.items[i].text; });
+    }
+    const s = await (await fetch('/api/status')).json();
+    document.getElementById('status').textContent =
+      `状态：${s.mode==='commit'?'上屏模式':'记录模式（不上屏）'} · 开关热键 ${s.hotkey||'无（用托盘图标）'} · 共 ${s.total} 条 · 每 3 秒自动刷新`;
+  }catch(e){}
+}
+load(); setInterval(load, 3000);
+</script></body></html>"""
+
+
+class HistoryServer:
+    """仅绑定 127.0.0.1 的历史查询/模式控制/文件转写/总结接口"""
+
+    def __init__(self, store, state, hotkeys, ui_q, refiner, punct, cfg):
+        self.store = store
+        self.state = state
+        self.hotkeys = hotkeys
+        self.ui_q = ui_q
+        self.refiner = refiner
+        self.punct = punct
+        self.cfg = cfg
+        self.token = (cfg.get("api_token") or "").strip()
+
+        def _auth_ok(hdr_value):
+            return (not self.token) or hdr_value == self.token
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send(self, code, body, ctype):
+                data = body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", ctype + "; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _json(self, code, obj):
+                self._send(code, json.dumps(obj, ensure_ascii=False), "application/json")
+
+            def do_GET(self):
+                u = urlparse(self.path)
+                if u.path == "/":
+                    self._send(200, PAGE_HTML, "text/html")
+                elif u.path == "/api/history":
+                    q = parse_qs(u.query)
+                    limit = int(q.get("limit", ["100"])[0])
+                    since = int(q.get("since_id", ["0"])[0])
+                    rows = store.query(limit=limit, since_id=since)
+                    self._json(200, {"items": rows,
+                                     "last_id": rows[0]["id"] if rows else since})
+                elif u.path == "/api/status":
+                    with store.lock:
+                        total = len(store.items)
+                    self._json(200, {"running": state["mode"] == "commit",
+                                     "mode": state["mode"],
+                                     "hotkey": hotkeys.get("name"),
+                                     "total": total})
+                elif u.path == "/api/summary":
+                    q = parse_qs(u.query)
+                    date = q.get("date", [time.strftime("%Y-%m-%d")])[0]
+                    if valid_date(date) is None:
+                        self._json(400, {"ok": False, "error": "date must be YYYY-MM-DD"})
+                        return
+                    p = os.path.join(SUMMARIES_DIR, os.path.basename(date + ".md"))
+                    if os.path.isfile(p):
+                        with open(p, "r", encoding="utf-8") as f:
+                            self._send(200, f.read(), "text/plain")
+                    else:
+                        self._send(404, "no summary for " + date, "text/plain")
+                elif u.path == "/api/summaries":
+                    files = sorted(glob.glob(os.path.join(SUMMARIES_DIR, "*.md")))
+                    self._json(200, {"dates": [os.path.basename(x)[:-3] for x in files]})
+                else:
+                    self._send(404, "not found", "text/plain")
+
+            def do_POST(self):
+                u = urlparse(self.path)
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n).decode("utf-8") if n else ""
+                try:
+                    payload = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    payload = {}
+                if not _auth_ok(self.headers.get("X-Token")):
+                    self._json(401, {"ok": False, "error": "bad token"})
+                    return
+                if u.path == "/api/clear":
+                    store.clear()
+                    self._json(200, {"ok": True})
+                elif u.path == "/api/mode":
+                    mode = payload.get("mode")
+                    if payload.get("toggle"):
+                        mode = "ambient" if state["mode"] == "commit" else "commit"
+                    if mode in ("commit", "ambient"):
+                        ui_q.put(("mode", mode))
+                        self._json(200, {"ok": True, "mode": mode})
+                    else:
+                        self._json(400, {"ok": False,
+                                         "error": "mode must be commit|ambient, or toggle:true"})
+                elif u.path == "/api/summarize":
+                    date = payload.get("date") or (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+                    if valid_date(date) is None:
+                        self._json(400, {"ok": False, "error": "date must be YYYY-MM-DD"})
+                        return
+                    try:
+                        p = summarize_for_date(date, cfg, store)
+                        self._json(200, {"ok": True, "file": p})
+                    except Exception as exc:
+                        self._json(500, {"ok": False, "error": str(exc)})
+                elif u.path == "/api/transcribe":
+                    try:
+                        p = safe_media_path(payload.get("path", ""))
+                    except ValueError as exc:
+                        self._json(400, {"ok": False, "error": str(exc)})
+                        return
+                    try:
+                        text = transcribe_file(p, refiner, punct)
+                        if payload.get("log", True) and text:
+                            voice_log("[转写] " + os.path.basename(p) + " " + text, committed=False)
+                            store.add("transcribe", text, committed=False, refined=True)
+                        self._json(200, {"ok": True, "text": text, "chars": len(text)})
+                    except Exception as exc:
+                        self._json(500, {"ok": False, "error": str(exc)})
+                else:
+                    self._send(404, "not found", "text/plain")
+
+            def log_message(self, *args):  # 静默 access log
+                pass
+
+        self.Handler = Handler
+
+    def start(self):
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), self.Handler)
+        except OSError as exc:
+            log(f"历史页面端口 {HTTP_PORT} 被占用，接口与页面停用:", exc)
+            return
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log(f"历史页面: http://127.0.0.1:{HTTP_PORT}/")
+
+
+# ---------------- 主流程 ----------------
+
 def main():
-    log("=== 启动 v3 ===")
+    log("=== 启动 monikavoice ===")
+    cfg = load_config()
+    if not cfg.get("deepseek_api_key"):
+        log("[每日总结] 未配置 deepseek_api_key（config.json），总结功能停用")
     recognizer = build_recognizer()
     refiner = load_offline_refiner()
     punct = load_punctuation()
 
     audio_q = queue.Queue()
     ui_q = queue.Queue()
-    state = {"running": False}
+    state = {"mode": "ambient", "flush": threading.Event()}  # 常态=记录模式
     hotkeys = {}
     history = HistoryStore(HISTORY_PATH)
 
     def mic_callback(indata, frames, time_info, status):
-        if state["running"]:
-            audio_q.put(indata.copy())
+        audio_q.put(indata.copy())
 
     mic = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                          blocksize=SAMPLE_RATE // 10, callback=mic_callback)
@@ -487,9 +883,20 @@ def main():
     def dictation():
         s = recognizer.create_stream()
         last_partial = ""
-        buf, buf_samples = [], 0  # 距上次断句的原始音频，供离线精修
+        buf, buf_samples = [], 0  # 距上次断句的原始音频，供精修
 
-        def commit(stream_text, committed):
+        def flush_inflight():
+            """模式切换/退出时：正在录的半句截断，只上 log 不上屏"""
+            nonlocal buf, buf_samples, last_partial
+            if last_partial:
+                voice_log(last_partial, committed=False)
+                history.add("flush", last_partial, committed=False, refined=False)
+                ui_q.put(("partial", ""))
+            buf, buf_samples, last_partial = [], 0, ""
+            recognizer.reset(s)
+
+        def commit(stream_text):
+            """上屏模式断句：精修+同音替换+标点 → 上屏 + 上 log + 上历史"""
             nonlocal buf, buf_samples, last_partial
             refined = False
             text = stream_text
@@ -512,23 +919,20 @@ def main():
                 except Exception as exc:
                     log("[标点异常]", exc)
             if text:
-                history.add("dropped" if not committed else "final", text,
-                            committed=committed, refined=refined)
+                voice_log(text, committed=True)
+                history.add("final", text, committed=True, refined=refined)
                 ui_q.put(("final", text))
-                if committed:
-                    send_text(text)
+                send_text(text)
             buf, buf_samples, last_partial = [], 0, ""
             recognizer.reset(s)
 
         while True:
+            if state["flush"].is_set():
+                state["flush"].clear()
+                flush_inflight()
             try:
                 chunk = audio_q.get(timeout=0.1)
             except queue.Empty:
-                if not state["running"]:
-                    # 关闭听写时把已录但未断句的内容落历史（标记为未上屏）
-                    if buf_samples:
-                        commit(last_partial, committed=False)
-                    time.sleep(0.02)
                 continue
             try:
                 samples = chunk.reshape(-1)
@@ -540,9 +944,18 @@ def main():
                 partial = recognizer.get_result(s)
                 if partial != last_partial:
                     last_partial = partial
-                    ui_q.put(("partial", partial))
+                    if state["mode"] == "commit":
+                        ui_q.put(("partial", partial))
                 if recognizer.is_endpoint(s):
-                    commit(partial, committed=True)
+                    if state["mode"] == "commit":
+                        commit(partial)
+                    else:
+                        # 记录模式：只上 log，不精修不标点不上屏
+                        if partial:
+                            voice_log(partial, committed=False)
+                            history.add("ambient", partial, committed=False, refined=False)
+                        buf, buf_samples, last_partial = [], 0, ""
+                        recognizer.reset(s)
             except Exception as exc:
                 log("[识别/上屏异常]", exc)
                 time.sleep(0.1)
@@ -562,7 +975,7 @@ def main():
                 break
             log("热键注册失败（被占用）:", label)
         if not name:
-            log("所有备选热键均被占用，只能用托盘图标开关听写")
+            log("所有备选热键均被占用，只能用托盘图标/接口切换模式")
         hotkeys["name"] = name
         if not user32.RegisterHotKey(None, HOTKEY_QUIT, MOD_CONTROL | MOD_ALT, VK_Q):
             log("热键注册失败（被占用）: Ctrl+Alt+Q，可用托盘右键退出")
@@ -572,18 +985,18 @@ def main():
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_HOTKEY:
                 if msg.wParam == HOTKEY_TOGGLE:
-                    ui_q.put(("toggle", None))
+                    ui_q.put(("mode", "toggle"))
                 elif msg.wParam == HOTKEY_QUIT:
                     ui_q.put(("quit", None))
                     break
 
     threading.Thread(target=hotkey_worker, daemon=True).start()
 
-    HistoryServer(history, state, hotkeys).start()
+    HistoryServer(history, state, hotkeys, ui_q, refiner, punct, cfg).start()
 
-    # 托盘小图标：程序上线的常驻标志；左键=开关听写，右键=菜单
+    # 托盘图标：左键=唤出/收起上屏，右键=菜单
     def _tray_toggle(icon, item):
-        ui_q.put(("toggle", None))
+        ui_q.put(("mode", "toggle"))
 
     def _tray_history(icon, item):
         webbrowser.open_new(f"http://127.0.0.1:{HTTP_PORT}/")
@@ -592,9 +1005,9 @@ def main():
         ui_q.put(("quit", None))
 
     tray = pystray.Icon(
-        "monikavoice", PILImage.open(ICON64), "monikavoice 语音听写（运行中）",
+        "monikavoice", PILImage.open(ICON64), "monikavoice（记录中）",
         menu=pystray.Menu(
-            pystray.MenuItem("开始/停止听写", _tray_toggle, default=True),
+            pystray.MenuItem("唤出/收起上屏", _tray_toggle, default=True),
             pystray.MenuItem("历史记录（网页）", _tray_history),
             pystray.MenuItem("退出", _tray_quit),
         ),
@@ -602,10 +1015,16 @@ def main():
     tray.run_detached()
 
     win = FloatWindow(ui_q, state, audio_q)
+    win.tray = tray
+
+    threading.Thread(target=catchup_worker, args=(cfg, history), daemon=True).start()
+    threading.Thread(target=daily_worker, args=(cfg, history), daemon=True).start()
+
     try:
         win.root.mainloop()
     finally:
-        state["running"] = False
+        state["flush"].set()
+        time.sleep(1.0)  # 给识别线程留出截断上 log 的时间
         tid = hotkeys.get("tid")
         if tid:
             user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
