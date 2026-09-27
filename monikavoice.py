@@ -955,6 +955,9 @@ PAGE_HTML = """<!doctype html>
  .badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;margin-right:8px}
  .committed{background:#1e3a29;color:#81c995}
  .dropped{background:#3a2e1e;color:#fdd663}
+ .spk-other{background:#26314a;color:#8ab4f8}
+ .spk-me{background:#2a2540;color:#c58af9}
+ .spk-unknown{background:#2a2a2e;color:#9aa0a6}
  .text{font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
  #empty{color:#9aa0a6;text-align:center;padding:40px 0}
  .api{color:#9aa0a6;font-size:12px;margin-top:18px;line-height:1.8}
@@ -1033,9 +1036,11 @@ async function load(){
       list.innerHTML = d.items.map(e =>
         `<div class="item"><div class="meta">` +
         `<span class="badge ${e.committed?'committed':'dropped'}">${e.committed?'已上屏':'未上屏'}</span>` +
+        `<span class="badge ${e.speaker==='我'?'spk-me':(e.speaker&&e.speaker!=='未知'?'spk-other':'spk-unknown')}" data-spk></span>` +
         `#${e.id} · ${e.ts} · ${e.type}${e.refined?' · 已精修':''}</div>` +
         `<div class="text"></div></div>`).join('');
       list.querySelectorAll('.text').forEach((el,i)=>{ el.textContent = d.items[i].text; });
+      list.querySelectorAll('[data-spk]').forEach((el,i)=>{ el.textContent = d.items[i].speaker || '未知'; });
     }
     const s = await (await fetch('/api/status')).json();
     document.getElementById('status').textContent =
