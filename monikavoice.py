@@ -9,16 +9,23 @@ monikavoice —— Windows 离线中文语音听写（本地运行，无广告�
   同音替换器（jieba）整句精修纠正同音错别字，再经 ct-transformer 加标点，
   最后以 Unicode 按键打进当前焦点输入框
 - 托盘图标常驻：左键开关听写，右键菜单
+- 历史记录：全部识别内容（含未上屏的）写入 history.jsonl，浏览器打开
+  http://127.0.0.1:8397/ 查看；/api/history 等接口供其他程序调用
 """
 import ctypes
 import ctypes.wintypes as wt
 import glob
+import json
 import os
 import queue
 import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 import numpy as np
 import sherpa_onnx
@@ -43,6 +50,71 @@ PARAFORMER_DIR = os.path.join(BASE, "sherpa-onnx-paraformer-zh-2023-09-14")
 HR_DIR = os.path.join(BASE, "hr")
 LOG_PATH = os.path.join(BASE, "monikavoice.log")
 ICON64 = os.path.join(BASE, "icon64.png")
+HISTORY_PATH = os.path.join(BASE, "history.jsonl")
+HTTP_PORT = 8397
+HISTORY_MAX = 1000  # 内存与文件各自保留的最大条数
+
+
+class HistoryStore:
+    """识别历史：内存 deque + JSONL 追加落盘，重启后载入尾部继续"""
+
+    def __init__(self, path, maxlen=HISTORY_MAX):
+        self.path = path
+        self.lock = threading.Lock()
+        self.items = deque(maxlen=maxlen)
+        self.next_id = 1
+        self._load_tail()
+
+    def _load_tail(self):
+        if not os.path.isfile(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                tail = deque(f, maxlen=HISTORY_MAX)
+            for line in tail:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    self.items.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            if self.items:
+                self.next_id = self.items[-1].get("id", 0) + 1
+        except OSError as exc:
+            log("历史文件读取失败:", exc)
+
+    def add(self, kind, text, committed, refined):
+        entry = {
+            "id": self.next_id,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": kind,          # final=断句上屏, dropped=录到但未上屏
+            "committed": bool(committed),
+            "refined": bool(refined),
+            "text": text,
+        }
+        with self.lock:
+            self.items.append(entry)
+            self.next_id += 1
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except OSError as exc:
+                log("历史写入失败:", exc)
+
+    def query(self, limit=100, since_id=0):
+        with self.lock:
+            rows = [e for e in self.items if e["id"] > since_id]
+        rows.sort(key=lambda e: e["id"], reverse=True)
+        return rows[:max(1, min(limit, HISTORY_MAX))]
+
+    def clear(self):
+        with self.lock:
+            self.items.clear()
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
 
 
 def log(*args):
@@ -183,6 +255,118 @@ def load_punctuation():
         return None
 
 
+PAGE_HTML = """<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<title>monikavoice 历史记录</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+ body{background:#141416;color:#e8eaed;font-family:"Microsoft YaHei UI",sans-serif;margin:0;padding:24px}
+ h1{font-size:18px;font-weight:600;margin:0 0 4px}
+ .sub{color:#9aa0a6;font-size:12px;margin-bottom:16px}
+ .item{background:#1f1f23;border-radius:8px;padding:10px 14px;margin-bottom:8px}
+ .meta{font-size:11px;color:#9aa0a6;margin-bottom:4px}
+ .badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;margin-right:8px}
+ .committed{background:#1e3a29;color:#81c995}
+ .dropped{background:#3a2e1e;color:#fdd663}
+ .text{font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+ #empty{color:#9aa0a6;text-align:center;padding:40px 0}
+ .api{color:#9aa0a6;font-size:12px;margin-top:18px;line-height:1.8}
+ code{background:#1f1f23;padding:1px 6px;border-radius:4px}
+</style></head><body>
+<h1>monikavoice 历史记录</h1>
+<div class="sub" id="status">加载中…</div>
+<div id="list"></div>
+<div class="api">
+ API：<code>GET /api/history?limit=100&amp;since_id=0</code> ·
+ <code>GET /api/status</code> · <code>POST /api/clear</code>（仅本机 127.0.0.1 可访问）
+</div>
+<script>
+let lastId = 0;
+async function load(){
+  try{
+    const r = await fetch('/api/history?limit=200');
+    const d = await r.json();
+    const list = document.getElementById('list');
+    if(!d.items.length){ list.innerHTML = '<div id="empty">还没有记录</div>'; }
+    else{
+      list.innerHTML = d.items.map(e =>
+        `<div class="item"><div class="meta">` +
+        `<span class="badge ${e.committed?'committed':'dropped'}">${e.committed?'已上屏':'未上屏'}</span>` +
+        `#${e.id} · ${e.ts}${e.refined?' · 已精修':''}</div>` +
+        `<div class="text"></div></div>`).join('');
+      list.querySelectorAll('.text').forEach((el,i)=>{ el.textContent = d.items[i].text; });
+    }
+    const s = await (await fetch('/api/status')).json();
+    document.getElementById('status').textContent =
+      `状态：${s.running?'听写中':'待命'} · 开关热键 ${s.hotkey||'无（用托盘图标）'} · 共 ${s.total} 条 · 每 3 秒自动刷新`;
+  }catch(e){}
+}
+load(); setInterval(load, 3000);
+</script></body></html>"""
+
+
+class HistoryServer:
+    """仅绑定 127.0.0.1 的历史查询接口与页面"""
+
+    def __init__(self, store, state, hotkeys):
+        self.store = store
+        self.state = state
+        self.hotkeys = hotkeys
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send(self, code, body, ctype):
+                data = body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", ctype + "; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                u = urlparse(self.path)
+                if u.path == "/":
+                    self._send(200, PAGE_HTML, "text/html")
+                elif u.path == "/api/history":
+                    q = parse_qs(u.query)
+                    limit = int(q.get("limit", ["100"])[0])
+                    since = int(q.get("since_id", ["0"])[0])
+                    rows = store.query(limit=limit, since_id=since)
+                    self._send(200, json.dumps(
+                        {"items": rows, "last_id": rows[0]["id"] if rows else since},
+                        ensure_ascii=False), "application/json")
+                elif u.path == "/api/status":
+                    with store.lock:
+                        total = len(store.items)
+                    self._send(200, json.dumps({
+                        "running": state["running"],
+                        "hotkey": hotkeys.get("name"),
+                        "total": total,
+                    }, ensure_ascii=False), "application/json")
+                else:
+                    self._send(404, "not found", "text/plain")
+
+            def do_POST(self):
+                if urlparse(self.path).path == "/api/clear":
+                    store.clear()
+                    self._send(200, json.dumps({"ok": True}), "application/json")
+                else:
+                    self._send(404, "not found", "text/plain")
+
+            def log_message(self, *args):  # 静默 access log
+                pass
+
+        self.Handler = Handler
+
+    def start(self):
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), self.Handler)
+        except OSError as exc:
+            log(f"历史页面端口 {HTTP_PORT} 被占用，接口与页面停用:", exc)
+            return
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log(f"历史页面: http://127.0.0.1:{HTTP_PORT}/")
+
+
 class FloatWindow:
     """听写时弹出的置顶小浮窗：实时显示识别内容，不抢目标应用焦点"""
 
@@ -236,7 +420,9 @@ class FloatWindow:
                     self.hotkey_name = payload or "无"
                     self.refresh_header()
                 elif cmd == "quit":
-                    self.root.destroy()
+                    # 先停听写，给识别线程约 1 秒把未上屏内容落历史，再退出
+                    self.state["running"] = False
+                    self.root.after(1000, self.root.destroy)
                     return
         except queue.Empty:
             pass
@@ -288,6 +474,7 @@ def main():
     ui_q = queue.Queue()
     state = {"running": False}
     hotkeys = {}
+    history = HistoryStore(HISTORY_PATH)
 
     def mic_callback(indata, frames, time_info, status):
         if state["running"]:
@@ -302,8 +489,9 @@ def main():
         last_partial = ""
         buf, buf_samples = [], 0  # 距上次断句的原始音频，供离线精修
 
-        def commit(stream_text):
+        def commit(stream_text, committed):
             nonlocal buf, buf_samples, last_partial
+            refined = False
             text = stream_text
             if refiner is not None and buf_samples > SAMPLE_RATE // 2:
                 try:
@@ -311,10 +499,11 @@ def main():
                     rs = refiner.create_stream()
                     rs.accept_waveform(SAMPLE_RATE, np.concatenate(buf))
                     refiner.decode_stream(rs)
-                    refined = rs.result.text.strip()
-                    if refined:
-                        text = refined
-                        log("[精修]", round((time.time() - t0) * 1000), "ms:", refined)
+                    refined_text = rs.result.text.strip()
+                    if refined_text:
+                        text = refined_text
+                        refined = True
+                    log("[精修]", round((time.time() - t0) * 1000), "ms:", text)
                 except Exception as exc:
                     log("[精修异常，用流式结果]", exc)
             if text and punct is not None:
@@ -323,8 +512,11 @@ def main():
                 except Exception as exc:
                     log("[标点异常]", exc)
             if text:
+                history.add("dropped" if not committed else "final", text,
+                            committed=committed, refined=refined)
                 ui_q.put(("final", text))
-                send_text(text)
+                if committed:
+                    send_text(text)
             buf, buf_samples, last_partial = [], 0, ""
             recognizer.reset(s)
 
@@ -333,6 +525,9 @@ def main():
                 chunk = audio_q.get(timeout=0.1)
             except queue.Empty:
                 if not state["running"]:
+                    # 关闭听写时把已录但未断句的内容落历史（标记为未上屏）
+                    if buf_samples:
+                        commit(last_partial, committed=False)
                     time.sleep(0.02)
                 continue
             try:
@@ -347,7 +542,7 @@ def main():
                     last_partial = partial
                     ui_q.put(("partial", partial))
                 if recognizer.is_endpoint(s):
-                    commit(partial)
+                    commit(partial, committed=True)
             except Exception as exc:
                 log("[识别/上屏异常]", exc)
                 time.sleep(0.1)
@@ -384,9 +579,14 @@ def main():
 
     threading.Thread(target=hotkey_worker, daemon=True).start()
 
+    HistoryServer(history, state, hotkeys).start()
+
     # 托盘小图标：程序上线的常驻标志；左键=开关听写，右键=菜单
     def _tray_toggle(icon, item):
         ui_q.put(("toggle", None))
+
+    def _tray_history(icon, item):
+        webbrowser.open_new(f"http://127.0.0.1:{HTTP_PORT}/")
 
     def _tray_quit(icon, item):
         ui_q.put(("quit", None))
@@ -395,6 +595,7 @@ def main():
         "monikavoice", PILImage.open(ICON64), "monikavoice 语音听写（运行中）",
         menu=pystray.Menu(
             pystray.MenuItem("开始/停止听写", _tray_toggle, default=True),
+            pystray.MenuItem("历史记录（网页）", _tray_history),
             pystray.MenuItem("退出", _tray_quit),
         ),
     )

@@ -17,4 +17,5 @@ VoiceInput.exe
 
 # 运行产物（含语音识别内容，禁止入库）
 *.log
+history.jsonl
 __pycache__/
