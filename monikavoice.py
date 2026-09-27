@@ -77,7 +77,7 @@ DEFAULT_CONFIG = {
     "api_token": "",
     "denoise_enable": True,
     "speaker_enable": True,
-    "speaker_threshold": 0.55,
+    "speaker_threshold": 0.5,
 }
 
 
@@ -442,7 +442,8 @@ class SpeakerRegistry:
 
     def label(self, samples):
         """返回 (说话人名, 相似度)：只匹配已注册声纹（自助录入或"我"），
-        匹配不上的一律"未知"——环境碎音不会自动创建新聚类"""
+        匹配不上的一律"未知"——环境碎音不会自动创建新聚类。
+        命中时质心轻微向本次嵌入漂移（EMA 0.08），自适应不同距离/姿态"""
         if not self.enabled:
             return "", 0.0
         emb = self._embed(samples)
@@ -452,6 +453,22 @@ class SpeakerRegistry:
             if self.manager is not None:
                 name = self.manager.search(emb, self.threshold)
                 if name:
+                    changed = False
+                    if name == "我" and self.user_centroid:
+                        self.user_centroid = [a + 0.08 * (b - a) for a, b in
+                                              zip(self.user_centroid, emb)]
+                        changed = True
+                    elif name in self.named and self.named[name].get("centroid"):
+                        c = self.named[name]["centroid"]
+                        self.named[name]["centroid"] = [a + 0.08 * (b - a) for a, b in
+                                                        zip(c, emb)]
+                        changed = True
+                    if changed:
+                        self._rebuild()
+                        now = time.time()
+                        if now - getattr(self, "_last_save", 0) > 60:
+                            self._last_save = now
+                            self._save()
                     return name, 1.0
             return "未知", 0.0
 
@@ -525,6 +542,9 @@ class SpeakerRegistry:
                 self.manager.add(name, [rec["centroid"]])
         for name, c in self.others.items():
             self.manager.add(name, [c])
+
+    def _rebuild(self):
+        self._rebuild_manager()
 
     def list_speakers(self):
         with self.lock:
@@ -947,13 +967,17 @@ PAGE_HTML = """<!doctype html>
  <b style="font-size:13px">声纹管理</b>
  <div style="margin-top:8px;font-size:13px">
   录入 <input id="en-name" placeholder="名字" style="width:90px;background:#141416;color:#e8eaed;border:1px solid #3c4043;border-radius:4px;padding:3px 6px">
-  <input id="en-path" placeholder="该人说话的 wav 绝对路径" style="width:340px;background:#141416;color:#e8eaed;border:1px solid #3c4043;border-radius:4px;padding:3px 6px">
-  <button onclick="svPost('/api/enroll','en',this)">录入</button>
+  <button onclick="svLive('/api/record_enroll','en')">● 录 5 秒录入</button>
+  或用文件
+  <input id="en-path" placeholder="wav 绝对路径" style="width:250px;background:#141416;color:#e8eaed;border:1px solid #3c4043;border-radius:4px;padding:3px 6px">
+  <button onclick="svPost('/api/enroll','en',this)">文件录入</button>
   <span id="en-out" class="meta"></span>
  </div>
  <div style="margin-top:6px;font-size:13px">
-  判断 <input id="who-path" placeholder="wav 绝对路径" style="width:440px;background:#141416;color:#e8eaed;border:1px solid #3c4043;border-radius:4px;padding:3px 6px">
-  <button onclick="svPost('/api/who','who',this)">判断</button>
+  判断 <button onclick="svLive('/api/record_who','who')">● 录 5 秒判断</button>
+  或用文件
+  <input id="who-path" placeholder="wav 绝对路径" style="width:250px;background:#141416;color:#e8eaed;border:1px solid #3c4043;border-radius:4px;padding:3px 6px">
+  <button onclick="svPost('/api/who','who',this)">文件判断</button>
   <span id="who-out" class="meta"></span>
  </div>
  <div id="spk-list" class="meta" style="margin-top:8px"></div>
@@ -965,6 +989,22 @@ PAGE_HTML = """<!doctype html>
  （仅本机 127.0.0.1 可访问；配置 api_token 后 POST 需带 X-Token 头）
 </div>
 <script>
+async function svLive(url, outId){
+  const out = document.getElementById(outId + '-out');
+  out.textContent = '● 录音中，请对着麦克风说话 5 秒…';
+  try{
+    const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({seconds: 5, name: document.getElementById('en-name').value})});
+    const d = await r.json();
+    if(url === '/api/record_enroll'){ out.textContent = d.ok ? ('已注册 '+d.name+'（样本 '+d.samples+' 条）') : ('失败: '+(d.error||'未知')); }
+    else{
+      const top = Object.entries(d.scores||{}).sort((a,b)=>b[1]-a[1]).slice(0,3)
+        .map(([k,v])=>k+' '+v).join('，');
+      out.textContent = d.ok ? ('最像: '+d.speaker+'（相似度 '+d.similarity+'）｜'+top) : ('失败: '+(d.error||'未知'));
+    }
+    load();
+  }catch(e){ out.textContent = '请求失败'; }
+}
 async function svPost(url, outId, btn){
   const out = document.getElementById(outId + '-out');
   out.textContent = '处理中…';
@@ -1015,7 +1055,7 @@ class HistoryServer:
     """仅绑定 127.0.0.1 的历史查询/模式控制/文件转写/总结接口"""
 
     def __init__(self, store, state, hotkeys, ui_q, refiner, punct, cfg,
-                 denoiser=None, registry=None):
+                 denoiser=None, registry=None, capture=None):
         self.store = store
         self.state = state
         self.hotkeys = hotkeys
@@ -1025,7 +1065,9 @@ class HistoryServer:
         self.cfg = cfg
         self.denoiser = denoiser
         self.registry = registry
+        self.capture = capture or {}
         self.token = (cfg.get("api_token") or "").strip()
+        hs = self  # Handler 内通过闭包访问服务端状态（self 已被 Handler 实例占用）
 
         def _auth_ok(hdr_value):
             return (not self.token) or hdr_value == self.token
@@ -1081,6 +1123,22 @@ class HistoryServer:
                     self._json(200, registry.list_speakers() if registry else {"named": {}, "clustered": []})
                 else:
                     self._send(404, "not found", "text/plain")
+
+            def _record_seconds(self, seconds):
+                """从麦克风采集指定秒数，返回拼接的 float32 音频（独占采集通道）"""
+                seconds = max(2, min(30, int(seconds or 5)))
+                cap = hs.capture
+                if cap.get("active"):
+                    if not cap["done"].wait(timeout=2.0):
+                        raise RuntimeError("已有录音在进行")
+                cap["buf"] = []
+                cap["need"] = SAMPLE_RATE * seconds
+                cap["done"].clear()
+                cap["active"] = True
+                if not cap["done"].wait(timeout=seconds + 3):
+                    cap["active"] = False
+                    raise RuntimeError("录音超时")
+                return np.concatenate(cap["buf"]).reshape(-1)
 
             def do_POST(self):
                 u = urlparse(self.path)
@@ -1143,6 +1201,40 @@ class HistoryServer:
                                          "similarity": sim, "scores": scores})
                     except Exception as exc:
                         self._json(500, {"ok": False, "error": str(exc)})
+                elif u.path == "/api/record_enroll":
+                    name = str(payload.get("name", "")).strip()
+                    if not name:
+                        self._json(400, {"ok": False, "error": "name required"})
+                        return
+                    try:
+                        samples = self._record_seconds(payload.get("seconds", 5))
+                    except RuntimeError as exc:
+                        self._json(409, {"ok": False, "error": str(exc)})
+                        return
+                    if denoiser is not None:
+                        try:
+                            samples = denoiser.run(samples, SAMPLE_RATE).samples
+                        except Exception:
+                            pass
+                    count, is_new = registry.enroll_speaker(name, samples) if registry \
+                        else (0, False)
+                    self._json(200, {"ok": bool(count), "name": name,
+                                     "samples": count, "new": is_new})
+                elif u.path == "/api/record_who":
+                    try:
+                        samples = self._record_seconds(payload.get("seconds", 5))
+                    except RuntimeError as exc:
+                        self._json(409, {"ok": False, "error": str(exc)})
+                        return
+                    if denoiser is not None:
+                        try:
+                            samples = denoiser.run(samples, SAMPLE_RATE).samples
+                        except Exception:
+                            pass
+                    name, sim, scores = registry.who(samples) if registry \
+                        else ("未知", 0.0, {})
+                    self._json(200, {"ok": True, "speaker": name,
+                                     "similarity": sim, "scores": scores})
                 elif u.path == "/api/forget":
                     name = str(payload.get("name", "")).strip()
                     removed = registry.forget(name) if registry else False
@@ -1223,8 +1315,15 @@ def main():
     hotkeys = {}
     history = HistoryStore(HISTORY_PATH)
 
+    capture = {"active": False, "buf": [], "need": 0, "done": threading.Event()}
+
     def mic_callback(indata, frames, time_info, status):
         audio_q.put(indata.copy())
+        if capture["active"]:
+            capture["buf"].append(indata.copy())
+            if sum(len(x) for x in capture["buf"]) >= capture["need"]:
+                capture["active"] = False
+                capture["done"].set()
 
     mic = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                          blocksize=SAMPLE_RATE // 10, callback=mic_callback)
@@ -1375,7 +1474,7 @@ def main():
     threading.Thread(target=hotkey_worker, daemon=True).start()
 
     HistoryServer(history, state, hotkeys, ui_q, refiner, punct, cfg,
-                  denoiser, registry).start()
+                  denoiser, registry, capture).start()
 
     # 托盘图标：左键=唤出/收起上屏，右键=菜单
     def _tray_toggle(icon, item):
