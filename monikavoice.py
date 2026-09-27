@@ -59,6 +59,9 @@ LOG_PATH = os.path.join(BASE, "monikavoice.log")
 HISTORY_PATH = os.path.join(BASE, "history.jsonl")
 CONFIG_PATH = os.path.join(BASE, "config.json")
 ICON64 = os.path.join(BASE, "icon64.png")
+SPEAKER_MODEL = os.path.join(BASE, "campplus.onnx")
+DENOISER_MODEL = os.path.join(BASE, "gtcrn_simple.onnx")
+SPEAKERS_JSON = os.path.join(BASE, "speakers.json")
 HTTP_PORT = 8397
 HISTORY_MAX = 2000
 RETAIN_DAYS = 183  # 六个月
@@ -72,6 +75,9 @@ DEFAULT_CONFIG = {
     "deepseek_model": "deepseek-chat",
     "summary_hour": 2,
     "api_token": "",
+    "denoise_enable": True,
+    "speaker_enable": True,
+    "speaker_threshold": 0.55,
 }
 
 
@@ -94,13 +100,15 @@ def log(*args):
         pass
 
 
-def voice_log(text, committed):
-    """语音内容按天落盘：logs/voice-YYYY-MM-DD.log，每行 [时间] 标记 文本"""
+def voice_log(text, committed, speaker=""):
+    """语音内容按天落盘：logs/voice-YYYY-MM-DD.log
+    每行 [时间] [说话人] 标记 文本"""
     try:
         os.makedirs(LOGS_DIR, exist_ok=True)
         name = os.path.basename("voice-" + time.strftime("%Y-%m-%d") + ".log")
+        tag = "[" + speaker + "] " if speaker else ""
         with open(os.path.join(LOGS_DIR, name), "a", encoding="utf-8") as f:
-            f.write(time.strftime("[%H:%M:%S] ") + ("上屏 " if committed else "记录 ") + text + "\n")
+            f.write(time.strftime("[%H:%M:%S] ") + tag + ("上屏 " if committed else "记录 ") + text + "\n")
     except OSError as exc:
         log("语音日志写入失败:", exc)
 
@@ -149,13 +157,14 @@ class HistoryStore:
         except OSError as exc:
             log("历史文件读取失败:", exc)
 
-    def add(self, kind, text, committed, refined):
+    def add(self, kind, text, committed, refined, speaker=""):
         entry = {
             "id": self.next_id,
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             "type": kind,          # final=上屏, flush=切换截断, ambient=常态记录, transcribe=文件转写
             "committed": bool(committed),
             "refined": bool(refined),
+            "speaker": speaker,
             "text": text,
         }
         with self.lock:
@@ -321,6 +330,154 @@ def load_punctuation():
         return None
 
 
+def load_denoiser():
+    """GT-CRN 人声增强/降噪，加载失败则原样透传"""
+    if not os.path.isfile(DENOISER_MODEL):
+        log("降噪模型缺失，人声增强关闭")
+        return None
+    try:
+        den = sherpa_onnx.OfflineSpeechDenoiser(
+            sherpa_onnx.OfflineSpeechDenoiserConfig(
+                model=sherpa_onnx.OfflineSpeechDenoiserModelConfig(
+                    gtcrn=sherpa_onnx.OfflineSpeechDenoiserGtcrnModelConfig(model=DENOISER_MODEL),
+                    num_threads=2)))
+        log("人声增强(GT-CRN)已加载")
+        return den
+    except Exception as exc:
+        log("降噪模型加载失败，人声增强关闭:", exc)
+        return None
+
+
+class SpeakerRegistry:
+    """声纹识别：注册过的说话人（自动从上屏模式采集"我"）优先匹配，
+    未匹配的按余弦相似度聚成"他人N"。speakers.json 存声纹特征（含生物特征，勿外传）"""
+
+    MIN_SAMPLES = 1.0  # 至少 1 秒音频才计算嵌入
+
+    def __init__(self, cfg):
+        self.enabled = bool(cfg.get("speaker_enable", True)) and os.path.isfile(SPEAKER_MODEL)
+        self.threshold = float(cfg.get("speaker_threshold", 0.55))
+        self.extractor = None
+        self.manager = None
+        self.user_centroid = None
+        self.user_count = 0
+        self.user_samples = []
+        self.others = {}   # name -> centroid(list[float])
+        self.next_other = 1
+        self.lock = threading.Lock()
+        if not self.enabled:
+            log("声纹识别关闭（缺模型或配置禁用）")
+            return
+        try:
+            self.extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
+                sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=SPEAKER_MODEL, num_threads=2))
+            self.manager = sherpa_onnx.SpeakerEmbeddingManager(self.extractor.dim)
+            self._load()
+            log("声纹识别已加载（注册说话人: " +
+                (", ".join([n for n in ["我"] if self.user_centroid] + list(self.others)) or "无") + "）")
+        except Exception as exc:
+            log("声纹识别加载失败，来源标注关闭:", exc)
+            self.enabled = False
+
+    def _load(self):
+        try:
+            with open(SPEAKERS_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            u = data.get("我")
+            if u and u.get("centroid"):
+                self.user_centroid = u["centroid"]
+                self.user_count = u.get("count", len(u.get("samples", [])))
+                self.user_samples = u.get("samples", [])
+                self.manager.add("我", [self.user_centroid])
+            for name, c in (data.get("others") or {}).items():
+                self.others[name] = c
+                self.manager.add(name, [c])
+                idx = int(re.sub(r"\D", "", name) or 0)
+                self.next_other = max(self.next_other, idx + 1)
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
+    def _save(self):
+        try:
+            data = {}
+            if self.user_centroid:
+                data["我"] = {"centroid": self.user_centroid, "count": self.user_count,
+                              "samples": self.user_samples[-8:]}
+            data["others"] = self.others
+            with open(SPEAKERS_JSON, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except OSError as exc:
+            log("声纹档案保存失败:", exc)
+
+    def _embed(self, samples):
+        if self.extractor is None or len(samples) < SAMPLE_RATE * self.MIN_SAMPLES:
+            return None
+        st = self.extractor.create_stream()
+        st.accept_waveform(SAMPLE_RATE, np.asarray(samples, dtype=np.float32))
+        st.input_finished()
+        emb = []
+        while self.extractor.is_ready(st):
+            emb = self.extractor.compute(st)
+        return emb if emb else None
+
+    @staticmethod
+    def _cos(u, v):
+        u, v = np.asarray(u), np.asarray(v)
+        return float(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v) + 1e-9))
+
+    def label(self, samples):
+        """返回 (说话人名, 相似度)；音频太短返回 ("未知", 0)"""
+        if not self.enabled:
+            return "", 0.0
+        emb = self._embed(samples)
+        if emb is None:
+            return "未知", 0.0
+        with self.lock:
+            if self.manager is not None:
+                name = self.manager.search(emb, self.threshold)
+                if name:
+                    return name, 1.0
+            for name, c in self.others.items():
+                if self._cos(emb, c) >= self.threshold:
+                    self.others[name] = [a + 0.1 * (b - a) for a, b in zip(c, emb)]  # 缓慢更新质心
+                    return name, 1.0
+            name = "他人" + str(self.next_other)
+            self.next_other += 1
+            self.others[name] = list(emb)
+            self.manager.add(name, [list(emb)])
+            self._save()
+            return name, 1.0
+
+    def enroll_user(self, samples):
+        """上屏模式的话音 = 用户本人：采集嵌入，累计 >=2 条即注册/更新"我"质心"""
+        if not self.enabled:
+            return
+        emb = self._embed(samples)
+        if emb is None:
+            return
+        with self.lock:
+            self.user_samples.append(list(emb))
+            if len(self.user_samples) > 8:
+                self.user_samples = self.user_samples[-8:]
+            if len(self.user_samples) < 2:
+                return
+            self.user_centroid = list(np.mean(np.asarray(self.user_samples), axis=0))
+            self.user_count = len(self.user_samples)
+            # 清理注册前被误标成"他人N"的本人质心（与"我"几乎相同的都是早期误标）
+            mislabeled = [n for n, c in self.others.items()
+                          if self._cos(self.user_centroid, c) >= 0.85]
+            for n in mislabeled:
+                del self.others[n]
+            # 覆盖式重建 manager 中"我"的质心
+            self.manager = sherpa_onnx.SpeakerEmbeddingManager(self.extractor.dim)
+            self.manager.add("我", [self.user_centroid])
+            for name, c in self.others.items():
+                self.manager.add(name, [c])
+            if mislabeled:
+                log("[声纹] 已纠正误标的早期说话人:", ", ".join(mislabeled))
+            self._save()
+
+
 # ---------------- 文件转写（宿曜预留） ----------------
 
 def safe_media_path(path):
@@ -368,18 +525,23 @@ def _read_wav_mono16k(path):
     return data
 
 
-def transcribe_file(path, refiner, punct):
-    """转写音频文件：自动混单声道/重采样到 16k，30 秒分段走
-    Paraformer + 同音替换 + 标点，返回拼接文本"""
+def transcribe_file(path, refiner, punct, denoiser=None, registry=None, log_it=True):
+    """转写音频文件：降噪 → 30 秒分段 → Paraformer+同音替换+标点，
+    每段带声纹来源标注。返回 (拼接文本, 分段列表)"""
     if refiner is None:
         raise RuntimeError("离线精修模型未加载")
     data = _read_wav_mono16k(path)
     step = SAMPLE_RATE * 30
-    texts = []
+    texts, segs = [], []
     for i in range(0, max(1, len(data)), step):
         seg = data[i:i + step]
         if len(seg) < SAMPLE_RATE // 10:
             break
+        if denoiser is not None:
+            try:
+                seg = denoiser.run(seg, SAMPLE_RATE).samples
+            except Exception:
+                pass
         rs = refiner.create_stream()
         rs.accept_waveform(SAMPLE_RATE, np.asarray(seg, dtype=np.float32))
         refiner.decode_stream(rs)
@@ -390,8 +552,14 @@ def transcribe_file(path, refiner, punct):
             except Exception:
                 pass
         if t:
-            texts.append(t)
-    return "".join(texts)
+            spk = registry.label(seg) if registry else ("", 0)
+            spk_name = spk[0] if spk and spk[0] else "未知"
+            texts.append("[" + spk_name + "] " + t)
+            segs.append({"speaker": spk_name, "text": t})
+    if log_it and texts:
+        base = os.path.basename(path)
+        voice_log("[转写] " + base + " " + " ".join(texts), committed=False)
+    return "".join(texts), segs
 
 
 # ---------------- 每日任务：DeepSeek 总结 + 六个月清理 ----------------
@@ -729,7 +897,8 @@ load(); setInterval(load, 3000);
 class HistoryServer:
     """仅绑定 127.0.0.1 的历史查询/模式控制/文件转写/总结接口"""
 
-    def __init__(self, store, state, hotkeys, ui_q, refiner, punct, cfg):
+    def __init__(self, store, state, hotkeys, ui_q, refiner, punct, cfg,
+                 denoiser=None, registry=None):
         self.store = store
         self.state = state
         self.hotkeys = hotkeys
@@ -737,6 +906,8 @@ class HistoryServer:
         self.refiner = refiner
         self.punct = punct
         self.cfg = cfg
+        self.denoiser = denoiser
+        self.registry = registry
         self.token = (cfg.get("api_token") or "").strip()
 
         def _auth_ok(hdr_value):
@@ -771,7 +942,9 @@ class HistoryServer:
                     self._json(200, {"running": state["mode"] == "commit",
                                      "mode": state["mode"],
                                      "hotkey": hotkeys.get("name"),
-                                     "total": total})
+                                     "total": total,
+                                     "denoise": denoiser is not None,
+                                     "speaker": bool(registry and registry.enabled)})
                 elif u.path == "/api/summary":
                     q = parse_qs(u.query)
                     date = q.get("date", [time.strftime("%Y-%m-%d")])[0]
@@ -831,11 +1004,14 @@ class HistoryServer:
                         self._json(400, {"ok": False, "error": str(exc)})
                         return
                     try:
-                        text = transcribe_file(p, refiner, punct)
-                        if payload.get("log", True) and text:
-                            voice_log("[转写] " + os.path.basename(p) + " " + text, committed=False)
-                            store.add("transcribe", text, committed=False, refined=True)
-                        self._json(200, {"ok": True, "text": text, "chars": len(text)})
+                        text, segs = transcribe_file(
+                            p, refiner, punct, denoiser=denoiser,
+                            registry=registry,
+                            log_it=bool(payload.get("log", True)))
+                        store.add("transcribe", text, committed=False,
+                                  refined=True, speaker="多段" if len(segs) > 1 else (segs[0]["speaker"] if segs else "未知"))
+                        self._json(200, {"ok": True, "text": text,
+                                         "chars": len(text), "segments": segs})
                     except Exception as exc:
                         self._json(500, {"ok": False, "error": str(exc)})
                 else:
@@ -866,6 +1042,10 @@ def main():
     recognizer = build_recognizer()
     refiner = load_offline_refiner()
     punct = load_punctuation()
+    denoiser = load_denoiser() if cfg.get("denoise_enable", True) else None
+    if denoiser is None:
+        log("人声增强未启用")
+    registry = SpeakerRegistry(cfg)
 
     audio_q = queue.Queue()
     ui_q = queue.Queue()
@@ -885,26 +1065,19 @@ def main():
         last_partial = ""
         buf, buf_samples = [], 0  # 距上次断句的原始音频，供精修
 
-        def flush_inflight():
-            """模式切换/退出时：正在录的半句截断，只上 log 不上屏"""
-            nonlocal buf, buf_samples, last_partial
-            if last_partial:
-                voice_log(last_partial, committed=False)
-                history.add("flush", last_partial, committed=False, refined=False)
-                ui_q.put(("partial", ""))
-            buf, buf_samples, last_partial = [], 0, ""
-            recognizer.reset(s)
-
-        def commit(stream_text):
-            """上屏模式断句：精修+同音替换+标点 → 上屏 + 上 log + 上历史"""
-            nonlocal buf, buf_samples, last_partial
-            refined = False
-            text = stream_text
-            if refiner is not None and buf_samples > SAMPLE_RATE // 2:
+        def refine_block(block):
+            """降噪 → 离线精修 → 标点，返回 (文本, 是否精修)"""
+            text, refined = "", False
+            if denoiser is not None:
+                try:
+                    block = denoiser.run(block, SAMPLE_RATE).samples
+                except Exception as exc:
+                    log("[降噪异常]", exc)
+            if refiner is not None and len(block) > SAMPLE_RATE // 2:
                 try:
                     t0 = time.time()
                     rs = refiner.create_stream()
-                    rs.accept_waveform(SAMPLE_RATE, np.concatenate(buf))
+                    rs.accept_waveform(SAMPLE_RATE, np.asarray(block, dtype=np.float32))
                     refiner.decode_stream(rs)
                     refined_text = rs.result.text.strip()
                     if refined_text:
@@ -918,11 +1091,40 @@ def main():
                     text = punct.add_punctuation(text)
                 except Exception as exc:
                     log("[标点异常]", exc)
+            return text, refined
+
+        def flush_inflight():
+            """模式切换/退出时：正在录的半句截断，加标点后只上 log 不上屏"""
+            nonlocal buf, buf_samples, last_partial
+            if last_partial:
+                text = last_partial
+                if punct is not None:
+                    try:
+                        text = punct.add_punctuation(text)
+                    except Exception:
+                        pass
+                voice_log(text, committed=False, speaker="截断")
+                history.add("flush", text, committed=False, refined=False, speaker="截断")
+                ui_q.put(("partial", ""))
+            buf, buf_samples, last_partial = [], 0, ""
+            recognizer.reset(s)
+
+        def commit(stream_text):
+            """上屏模式断句：降噪+精修+同音替换+标点 → 声纹标注 → 上屏+log+历史"""
+            nonlocal buf, buf_samples, last_partial
+            block = np.concatenate(buf) if buf else np.zeros(SAMPLE_RATE // 10, dtype=np.float32)
+            text, refined = refine_block(block)
+            if not text:
+                text = stream_text
+            spk = registry.label(block)
+            speaker = spk[0] if spk and spk[0] else "未知"
             if text:
-                voice_log(text, committed=True)
-                history.add("final", text, committed=True, refined=refined)
+                voice_log(text, committed=True, speaker=speaker)
+                history.add("final", text, committed=True, refined=refined, speaker=speaker)
                 ui_q.put(("final", text))
                 send_text(text)
+            # 上屏模式默认是用户在打字，采集声纹自动注册/强化"我"
+            registry.enroll_user(block)
             buf, buf_samples, last_partial = [], 0, ""
             recognizer.reset(s)
 
@@ -950,10 +1152,20 @@ def main():
                     if state["mode"] == "commit":
                         commit(partial)
                     else:
-                        # 记录模式：只上 log，不精修不标点不上屏
-                        if partial:
-                            voice_log(partial, committed=False)
-                            history.add("ambient", partial, committed=False, refined=False)
+                        # 记录模式：降噪+精修+标点+声纹标注，只进日志不上屏
+                        block = np.concatenate(buf) if buf else None
+                        if block is not None or partial:
+                            text, refined = ("", False)
+                            if block is not None:
+                                text, refined = refine_block(block)
+                            if not text:
+                                text = partial
+                            spk = registry.label(block) if block is not None else ("未知", 0)
+                            speaker = spk[0] if spk and spk[0] else "未知"
+                            if text:
+                                voice_log(text, committed=False, speaker=speaker)
+                                history.add("ambient", text, committed=False,
+                                            refined=refined, speaker=speaker)
                         buf, buf_samples, last_partial = [], 0, ""
                         recognizer.reset(s)
             except Exception as exc:
@@ -992,7 +1204,8 @@ def main():
 
     threading.Thread(target=hotkey_worker, daemon=True).start()
 
-    HistoryServer(history, state, hotkeys, ui_q, refiner, punct, cfg).start()
+    HistoryServer(history, state, hotkeys, ui_q, refiner, punct, cfg,
+                  denoiser, registry).start()
 
     # 托盘图标：左键=唤出/收起上屏，右键=菜单
     def _tray_toggle(icon, item):

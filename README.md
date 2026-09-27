@@ -13,6 +13,8 @@ Windows 离线中文语音听写工具：按热键说话，文字自动打进当
   3. ct-transformer 自动补标点
   4. 文字以 Unicode 按键打进光标处（记事本、聊天框、IDE 通吃）
 - **托盘常驻图标**：左键开关听写，右键退出
+- **声纹识别**：逐句标注说话人来源——上屏模式的话音自动注册为"我"，其他人按声纹聚类为"他人1/2/…"，日志每行带 `[说话人]` 标签（CampPlus 嵌入 + 余弦阈值 0.55，同人/他人余弦差距大，实测 0.85 vs 0.23）
+- **人声增强**：GT-CRN 降噪模型接入精修与转写路径，嘈杂环境的人声更干净、识别更准
 - **历史记录**：全部识别内容（含关闭听写时未上屏的部分）持久化到 `history.jsonl`，内置网页查看页，并提供本机 HTTP API 供其他程序调用
 
 ## 工作原理
@@ -20,6 +22,8 @@ Windows 离线中文语音听写工具：按热键说话，文字自动打进当
 ```
 麦克风(16k，常态录音) ──► 流式 zipformer ──► 浮窗实时跟随（仅上屏模式）
                    │ 停顿 0.4s 断句
+                   ▼
+            GT-CRN 人声增强降噪
                    ▼
      ┌─ 记录模式(默认) ─► 按天日志 logs/voice-日期.log（不上屏）
      │
@@ -30,6 +34,8 @@ Windows 离线中文语音听写工具：按热键说话，文字自动打进当
         同音替换器纠错（jieba + replace.fst）
               ▼
         ct-transformer 自动标点
+              ▼
+        CampPlus 声纹标注来源（我 / 他人N）
               ▼
         SendInput(UNICODE) 打进当前输入框
 ```
@@ -48,6 +54,8 @@ Windows 离线中文语音听写工具：按热键说话，文字自动打进当
 | [Paraformer zh（阿里 FunASR）](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models) | 离线整句精修 | Apache-2.0 |
 | [ct-transformer 标点模型（FunASR）](https://github.com/k2-fsa/sherpa-onnx/releases/tag/punctuation-models) | 自动加标点 | Apache-2.0 |
 | [hr-files（dict / lexicon / replace.fst）](https://github.com/k2-fsa/sherpa-onnx/releases/tag/hr-files) | 同音替换资源 | Apache-2.0 |
+| [3D-Speaker CampPlus 声纹模型](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models) | 说话人来源标注 | Apache-2.0 |
+| [GT-CRN 降噪模型](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speech-enhancement-models) | 人声增强 | Apache-2.0 |
 | [jieba 词典](https://github.com/fxsjy/jieba) | 同音替换分词 | MIT |
 | [python-sounddevice / PortAudio](https://python-sounddevice.readthedocs.io/) | 麦克风采集 | MIT |
 | [pystray](https://pystray.readthedocs.io/) | 托盘图标 | LGPL-3.0 |

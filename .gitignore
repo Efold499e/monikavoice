@@ -22,3 +22,9 @@ config.json
 logs/
 summaries/
 __pycache__/
+
+# 声纹与降噪模型、声纹档案（生物特征，勿入库）
+campplus.onnx
+gtcrn_simple.onnx
+speakers.json
+test_sr_denoise.py
