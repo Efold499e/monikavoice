@@ -124,6 +124,10 @@ Windows 离线中文语音听写工具：按热键说话，文字自动打进当
 | `POST /api/mode` | `{"mode":"commit"/"ambient"}` 或 `{"toggle":true}` 切换上屏/记录 |
 | `POST /api/summarize` | `{"date":"YYYY-MM-DD"}` 立即生成某天总结 |
 | `POST /api/transcribe` | `{"path":"D:\\x.wav","log":true}` 转写音频文件（宿曜整理上课录音预留） |
+| `GET /api/speakers` | 列出已注册声纹 |
+| `POST /api/enroll` | `{"name":"张三","path":"D:\\x.wav"}` 自助录入声纹 |
+| `POST /api/who` | `{"path":"D:\\x.wav"}` 判断音频最像哪个已注册说话人 |
+| `POST /api/forget` | `{"name":"张三"}` 删除声纹 |
 | `POST /api/clear` | 清空历史（内存与 history.jsonl） |
 
 服务只监听 `127.0.0.1`；在 `config.json` 配置 `api_token` 后，所有 POST 需带 `X-Token` 头。配套的 AI 调用说明见 `~/.agents/monikavoice/SKILL.md`。

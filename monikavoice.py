@@ -354,6 +354,15 @@ class SpeakerRegistry:
 
     MIN_SAMPLES = 1.0  # 至少 1 秒音频才计算嵌入
 
+    @staticmethod
+    def _speakers_file():
+        """声纹档案路径：显式校验必须落在程序目录内，杜绝路径拼接逃逸"""
+        base = os.path.realpath(BASE)
+        p = os.path.realpath(os.path.join(base, "speakers.json"))
+        if os.path.dirname(p) != base:
+            raise ValueError("非法声纹档案路径")
+        return p
+
     def __init__(self, cfg):
         self.enabled = bool(cfg.get("speaker_enable", True)) and os.path.isfile(SPEAKER_MODEL)
         self.threshold = float(cfg.get("speaker_threshold", 0.55))
@@ -362,6 +371,7 @@ class SpeakerRegistry:
         self.user_centroid = None
         self.user_count = 0
         self.user_samples = []
+        self.named = {}    # name -> {"samples": [[float]], "count": int, "centroid": [float]} 自助录入
         self.others = {}   # name -> centroid(list[float])
         self.next_other = 1
         self.lock = threading.Lock()
@@ -389,6 +399,10 @@ class SpeakerRegistry:
                 self.user_count = u.get("count", len(u.get("samples", [])))
                 self.user_samples = u.get("samples", [])
                 self.manager.add("我", [self.user_centroid])
+            for name, rec in (data.get("named") or {}).items():
+                if rec and rec.get("centroid"):
+                    self.named[name] = rec
+                    self.manager.add(name, [rec["centroid"]])
             for name, c in (data.get("others") or {}).items():
                 self.others[name] = c
                 self.manager.add(name, [c])
@@ -404,6 +418,7 @@ class SpeakerRegistry:
                 data["我"] = {"centroid": self.user_centroid, "count": self.user_count,
                               "samples": self.user_samples[-8:]}
             data["others"] = self.others
+            data["named"] = self.named
             with open(SPEAKERS_JSON, "w", encoding="utf-8") as f:
                 json.dump(data, f)
         except OSError as exc:
@@ -426,7 +441,8 @@ class SpeakerRegistry:
         return float(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v) + 1e-9))
 
     def label(self, samples):
-        """返回 (说话人名, 相似度)；音频太短返回 ("未知", 0)"""
+        """返回 (说话人名, 相似度)：只匹配已注册声纹（自助录入或"我"），
+        匹配不上的一律"未知"——环境碎音不会自动创建新聚类"""
         if not self.enabled:
             return "", 0.0
         emb = self._embed(samples)
@@ -437,16 +453,7 @@ class SpeakerRegistry:
                 name = self.manager.search(emb, self.threshold)
                 if name:
                     return name, 1.0
-            for name, c in self.others.items():
-                if self._cos(emb, c) >= self.threshold:
-                    self.others[name] = [a + 0.1 * (b - a) for a, b in zip(c, emb)]  # 缓慢更新质心
-                    return name, 1.0
-            name = "他人" + str(self.next_other)
-            self.next_other += 1
-            self.others[name] = list(emb)
-            self.manager.add(name, [list(emb)])
-            self._save()
-            return name, 1.0
+            return "未知", 0.0
 
     def enroll_user(self, samples):
         """上屏模式的话音 = 用户本人：采集嵌入，累计 >=2 条即注册/更新"我"质心"""
@@ -476,6 +483,78 @@ class SpeakerRegistry:
             if mislabeled:
                 log("[声纹] 已纠正误标的早期说话人:", ", ".join(mislabeled))
             self._save()
+
+    def enroll_speaker(self, name, samples):
+        """自助录入：命名声纹，1 条即可注册；重复录入累积质心（最多 8 条）。
+        返回 (样本数, 是否新注册)"""
+        name = (name or "").strip()[:32] or "未命名"
+        emb = self._embed(samples)
+        if emb is None:
+            return 0, False
+        with self.lock:
+            is_new = name not in self.named
+            rec = self.named.setdefault(name, {"samples": [], "count": 0, "centroid": None})
+            rec["samples"].append(list(emb))
+            if len(rec["samples"]) > 8:
+                rec["samples"] = rec["samples"][-8:]
+            rec["count"] = len(rec["samples"])
+            rec["centroid"] = list(np.mean(np.asarray(rec["samples"]), axis=0))
+            self.manager.add(name, [rec["centroid"]])
+            self._save()
+            return rec["count"], is_new
+
+    def forget(self, name):
+        """删除一个命名声纹（"我"的自动档案也可删，会重新自动采集）"""
+        removed = self.named.pop(name, None) is not None
+        removed = (self.others.pop(name, None) is not None) or removed
+        if name == "我":
+            self.user_centroid = None
+            self.user_count = 0
+            self.user_samples = []
+        if removed:
+            self._rebuild_manager()
+            self._save()
+        return removed
+
+    def _rebuild_manager(self):
+        self.manager = sherpa_onnx.SpeakerEmbeddingManager(self.extractor.dim)
+        if self.user_centroid:
+            self.manager.add("我", [self.user_centroid])
+        for name, rec in self.named.items():
+            if rec.get("centroid"):
+                self.manager.add(name, [rec["centroid"]])
+        for name, c in self.others.items():
+            self.manager.add(name, [c])
+
+    def list_speakers(self):
+        with self.lock:
+            named = {n: r.get("count", 0) for n, r in self.named.items()}
+            if self.user_centroid:
+                named["我"] = self.user_count or named.get("我", 1)
+            return {"named": named, "clustered": sorted(self.others.keys())}
+
+    def who(self, samples):
+        """判断一段音频最像哪个已注册说话人。返回 (名字, 相似度, 全部分数)"""
+        if not self.enabled:
+            return "未知", 0.0, {}
+        emb = self._embed(samples)
+        if emb is None:
+            return "未知", 0.0, {}
+        with self.lock:
+            scores = {}
+            if self.user_centroid:
+                scores["我"] = round(self._cos(emb, self.user_centroid), 3)
+            for name, rec in self.named.items():
+                if rec.get("centroid"):
+                    scores[name] = round(self._cos(emb, rec["centroid"]), 3)
+            for name, c in self.others.items():
+                scores[name] = round(self._cos(emb, c), 3)
+        if not scores:
+            return "未知", 0.0, scores
+        best = max(scores, key=scores.get)
+        if scores[best] >= self.threshold:
+            return best, scores[best], scores
+        return "未知", scores[best], scores
 
 
 # ---------------- 文件转写（宿曜预留） ----------------
@@ -864,6 +943,21 @@ PAGE_HTML = """<!doctype html>
 <h1>monikavoice 历史记录</h1>
 <div class="sub" id="status">加载中…</div>
 <div id="list"></div>
+<div style="margin-top:24px;padding:14px;background:#1f1f23;border-radius:8px">
+ <b style="font-size:13px">声纹管理</b>
+ <div style="margin-top:8px;font-size:13px">
+  录入 <input id="en-name" placeholder="名字" style="width:90px;background:#141416;color:#e8eaed;border:1px solid #3c4043;border-radius:4px;padding:3px 6px">
+  <input id="en-path" placeholder="该人说话的 wav 绝对路径" style="width:340px;background:#141416;color:#e8eaed;border:1px solid #3c4043;border-radius:4px;padding:3px 6px">
+  <button onclick="svPost('/api/enroll','en',this)">录入</button>
+  <span id="en-out" class="meta"></span>
+ </div>
+ <div style="margin-top:6px;font-size:13px">
+  判断 <input id="who-path" placeholder="wav 绝对路径" style="width:440px;background:#141416;color:#e8eaed;border:1px solid #3c4043;border-radius:4px;padding:3px 6px">
+  <button onclick="svPost('/api/who','who',this)">判断</button>
+  <span id="who-out" class="meta"></span>
+ </div>
+ <div id="spk-list" class="meta" style="margin-top:8px"></div>
+</div>
 <div class="api">
  API：<code>GET /api/history?limit=100&amp;since_id=0</code> ·
  <code>GET /api/status</code> · <code>GET /api/summary?date=YYYY-MM-DD</code> ·
@@ -871,6 +965,24 @@ PAGE_HTML = """<!doctype html>
  （仅本机 127.0.0.1 可访问；配置 api_token 后 POST 需带 X-Token 头）
 </div>
 <script>
+async function svPost(url, outId, btn){
+  const out = document.getElementById(outId + '-out');
+  out.textContent = '处理中…';
+  const body = {};
+  if(outId === 'en'){ body.name = document.getElementById('en-name').value; body.path = document.getElementById('en-path').value; }
+  else { body.path = document.getElementById('who-path').value; }
+  try{
+    const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await r.json();
+    if(url === '/api/enroll'){ out.textContent = d.ok ? ('已注册 '+d.name+'（样本 '+d.samples+' 条）') : ('失败: '+(d.error||'未知')); }
+    else{
+      const top = Object.entries(d.scores||{}).sort((a,b)=>b[1]-a[1]).slice(0,3)
+        .map(([k,v])=>k+' '+v).join('，');
+      out.textContent = d.ok ? ('最像: '+d.speaker+'（相似度 '+d.similarity+'）｜'+top) : ('失败: '+(d.error||'未知'));
+    }
+    load();
+  }catch(e){ out.textContent = '请求失败'; }
+}
 async function load(){
   try{
     const r = await fetch('/api/history?limit=200');
@@ -888,6 +1000,11 @@ async function load(){
     const s = await (await fetch('/api/status')).json();
     document.getElementById('status').textContent =
       `状态：${s.mode==='commit'?'上屏模式':'记录模式（不上屏）'} · 开关热键 ${s.hotkey||'无（用托盘图标）'} · 共 ${s.total} 条 · 每 3 秒自动刷新`;
+    const sp = await (await fetch('/api/speakers')).json();
+    const parts = [];
+    for(const [k,v] of Object.entries(sp.named||{})) parts.push(k+'('+v+'条)');
+    for(const n of (sp.clustered||[])) parts.push(n);
+    document.getElementById('spk-list').textContent = '已注册声纹：' + (parts.join('，') || '无');
   }catch(e){}
 }
 load(); setInterval(load, 3000);
@@ -960,6 +1077,8 @@ class HistoryServer:
                 elif u.path == "/api/summaries":
                     files = sorted(glob.glob(os.path.join(SUMMARIES_DIR, "*.md")))
                     self._json(200, {"dates": [os.path.basename(x)[:-3] for x in files]})
+                elif u.path == "/api/speakers":
+                    self._json(200, registry.list_speakers() if registry else {"named": {}, "clustered": []})
                 else:
                     self._send(404, "not found", "text/plain")
 
@@ -970,13 +1089,64 @@ class HistoryServer:
                 try:
                     payload = json.loads(raw) if raw else {}
                 except json.JSONDecodeError:
+                    # Windows 路径的反斜杠常被客户端漏转义，退回宽松提取
                     payload = {}
+                    for key in ("path", "name", "date", "mode"):
+                        m = re.search(r'"%s"\s*:\s*"([^"]*)"' % key, raw)
+                        if m:
+                            payload[key] = m.group(1).replace("\\\\", "\\")
                 if not _auth_ok(self.headers.get("X-Token")):
                     self._json(401, {"ok": False, "error": "bad token"})
                     return
                 if u.path == "/api/clear":
                     store.clear()
                     self._json(200, {"ok": True})
+                elif u.path == "/api/enroll":
+                    try:
+                        p = safe_media_path(payload.get("path", ""))
+                    except ValueError as exc:
+                        self._json(400, {"ok": False, "error": str(exc)})
+                        return
+                    name = str(payload.get("name", "")).strip()
+                    if not name:
+                        self._json(400, {"ok": False, "error": "name required"})
+                        return
+                    try:
+                        samples = _read_wav_mono16k(p)
+                        if denoiser is not None:
+                            try:
+                                samples = denoiser.run(samples, SAMPLE_RATE).samples
+                            except Exception:
+                                pass
+                        count, is_new = registry.enroll_speaker(name, samples) if registry \
+                            else (0, False)
+                        self._json(200, {"ok": bool(count), "name": name,
+                                         "samples": count, "new": is_new})
+                    except Exception as exc:
+                        self._json(500, {"ok": False, "error": str(exc)})
+                elif u.path == "/api/who":
+                    try:
+                        p = safe_media_path(payload.get("path", ""))
+                    except ValueError as exc:
+                        self._json(400, {"ok": False, "error": str(exc)})
+                        return
+                    try:
+                        samples = _read_wav_mono16k(p)
+                        if denoiser is not None:
+                            try:
+                                samples = denoiser.run(samples, SAMPLE_RATE).samples
+                            except Exception:
+                                pass
+                        name, sim, scores = registry.who(samples) if registry \
+                            else ("未知", 0.0, {})
+                        self._json(200, {"ok": True, "speaker": name,
+                                         "similarity": sim, "scores": scores})
+                    except Exception as exc:
+                        self._json(500, {"ok": False, "error": str(exc)})
+                elif u.path == "/api/forget":
+                    name = str(payload.get("name", "")).strip()
+                    removed = registry.forget(name) if registry else False
+                    self._json(200, {"ok": removed, "name": name})
                 elif u.path == "/api/mode":
                     mode = payload.get("mode")
                     if payload.get("toggle"):
