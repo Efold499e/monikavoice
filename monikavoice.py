@@ -78,6 +78,7 @@ DEFAULT_CONFIG = {
     "denoise_enable": True,
     "speaker_enable": True,
     "speaker_threshold": 0.5,
+    "auto_enroll_user": False,  # 上屏语音是否自动注册"我"（默认关，避免录错人；手动录入更可控）
 }
 
 
@@ -1313,6 +1314,8 @@ def main():
     if denoiser is None:
         log("人声增强未启用")
     registry = SpeakerRegistry(cfg)
+    if not cfg.get("auto_enroll_user", False):
+        log("声纹自动注册已关闭（上屏语音不再自动采集；手动录入不受影响）")
 
     audio_q = queue.Queue()
     ui_q = queue.Queue()
@@ -1397,8 +1400,9 @@ def main():
                 history.add("final", text, committed=True, refined=refined, speaker=speaker)
                 ui_q.put(("final", text))
                 send_text(text)
-            # 上屏模式默认是用户在打字，采集声纹自动注册/强化"我"
-            registry.enroll_user(block)
+            # 上屏语音是否自动注册"我"（auto_enroll_user 开启时）
+            if cfg.get("auto_enroll_user", False):
+                registry.enroll_user(block)
             buf, buf_samples, last_partial = [], 0, ""
             recognizer.reset(s)
 
