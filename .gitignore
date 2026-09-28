@@ -21,6 +21,7 @@ history.jsonl
 config.json
 logs/
 summaries/
+HANDOFF.md
 __pycache__/
 
 # 声纹与降噪模型、声纹档案（生物特征，勿入库）
