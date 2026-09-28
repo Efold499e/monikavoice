@@ -664,7 +664,28 @@ def transcribe_file(path, refiner, punct, denoiser=None, registry=None, log_it=T
 
 # ---------------- 每日任务：DeepSeek 总结 + 六个月清理 ----------------
 
-LINE_RE = re.compile(r"\[(\d\d:\d\d:\d\d)\] (.*)$")
+LINE_RE = re.compile(r"\[(\d\d:\d\d:\d\d)\] (?:\[(?P<spk>[^\]]+)\] )?(?P<mark>上屏 |记录 |截断 )?(?P<text>.*)$")
+
+FILLER_ONLY_RE = re.compile(
+    r"^(?:嗯+|呃+|啊+|哎+|哦+|噢+|对+|好+|是+|行|去|切|喂|嘘|没有|不是|可以|谢谢|"
+    r"ok|yeah+|hello|哈+|好酷啊|我不对|这个|那个)+$", re.I)
+
+
+def is_noise_line(text):
+    """确定性噪音过滤：超短碎片/单字母数字/解码复读/纯语气词。
+    只用于总结前的输入净化，原始日志永不改动"""
+    core = re.sub(r"[，。！？、…\s,.!?：:\"'（）()\[\]—\-]", "", text)
+    if len(core) <= 4:
+        return True
+    if re.fullmatch(r"[A-Za-z0-9]+", core):
+        return True
+    if re.search(r"(.)\1{3,}", core):             # 据据据据（单字复读）
+        return True
+    if re.search(r"(\S{1,6})(\s?\1){3,}", text):  # the the the the（词组复读）
+        return True
+    if FILLER_ONLY_RE.match(core):
+        return True
+    return False
 
 
 def voice_log_path(date):
@@ -673,7 +694,7 @@ def voice_log_path(date):
 
 
 def collect_window(start_dt, end_dt):
-    """收集 [start_dt, end_dt] 内的语音日志行"""
+    """收集 [start_dt, end_dt] 内的语音日志，返回 [(显示行, 纯文本)]"""
     lines = []
     d = start_dt.date()
     while d <= end_dt.date():
@@ -687,7 +708,9 @@ def collect_window(start_dt, end_dt):
                             continue
                         t = datetime.combine(d, datetime.strptime(m.group(1), "%H:%M:%S").time())
                         if start_dt <= t <= end_dt:
-                            lines.append("[" + d.strftime("%m-%d ") + m.group(1) + "] " + m.group(2))
+                            spk = "[" + m.group("spk") + "] " if m.group("spk") else ""
+                            disp = "[" + d.strftime("%m-%d ") + m.group(1) + "] " + spk + m.group("text")
+                            lines.append((disp, m.group("text")))
             except OSError:
                 pass
         d += timedelta(days=1)
@@ -702,22 +725,32 @@ def _guarded_urlopen(req, timeout):
     return urlrequest.urlopen(req, timeout=timeout)
 
 
-def deepseek_summarize(cfg, range_label, transcript):
+def deepseek_summarize(cfg, range_label, transcript, mode="full"):
+    """mode: full=对已过滤内容出完整总结；points=长日志分段提取要点；combine=合并各段要点"""
+    if mode == "points":
+        system = ("你是语音日志整理助手。以下是一天中某一时段的语音识别内容（已预过滤噪音）。"
+                  "请提取其中有效信息和要点：有信息量的句子按主题归组；无意义的忽略。"
+                  "简体中文，300 字以内，只输出要点。")
+        user = "时段：" + range_label + "\n语音内容：\n" + transcript
+    elif mode == "combine":
+        system = ("你是个人语音日志整理助手。以下是同一天各时段的要点摘录，请合并为一份"
+                  "最终总结：按主题分组给出小标题和要点，明显待办单独列出；重复内容合并；"
+                  "过滤后没有有效内容就直说\"该时段无有效记录\"。简体中文，600 字以内。")
+        user = "时间范围：" + range_label + "\n各时段要点：\n" + transcript
+    else:
+        system = ("你是个人语音日志整理助手。输入是用户通过环境常开录音记录的原始内容，"
+                  "已经过程序预过滤，但可能仍有残留杂音，请再甄别一次：\n"
+                  "1) 剔除无意义碎片、语气词、没说完的半句；\n"
+                  "2) 剔除媒体/视频/游戏声音和与用户无关的对话；\n"
+                  "3) 剩余内容按主题分组，给出小标题和要点，明显待办单独列出；\n"
+                  "4) 过滤后没有有效内容就直说\"该时段无有效记录\"，不要硬凑；\n"
+                  "5) 简体中文，600 字以内。")
+        user = "时间范围：" + range_label + "\n语音内容：\n" + transcript
     body = json.dumps({
         "model": cfg.get("deepseek_model", "deepseek-chat"),
         "messages": [
-            {"role": "system", "content":
-                "你是个人语音日志整理助手。输入是用户通过环境常开录音记录的原始内容，"
-                "混有大量杂音和误识别碎片。请严格过滤后再总结：\n"
-                "1) 剔除无意义碎片：单字/单音节（嗯、N、据）、语气词连发、没说完的半句；\n"
-                "2) 剔除解码复读：同一个字/词连续重复多次的句子（如\"据据据据据的证据\""
-                "\"the the the the\"），这是对噪音解码失败的输出，整条丢弃；\n"
-                "3) 剔除媒体声音：电视/视频/游戏/AI语音被转成的句子、与用户无关的对话；\n"
-                "4) 合并完全重复的条目；\n"
-                "5) 剩余内容按主题分组，给出小标题和要点，明显待办单独列出；\n"
-                "6) 过滤后没有有效内容就直说\"该时段无有效记录\"，不要硬凑；\n"
-                "7) 简体中文，600 字以内。"},
-            {"role": "user", "content": "时间范围：" + range_label + "\n语音内容：\n" + transcript},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
         "temperature": 0.3,
         "max_tokens": 2000,
@@ -739,25 +772,53 @@ def summarize_for_date(date_str, cfg, store):
     hour = int(cfg.get("summary_hour", 2))
     start_dt = datetime(day.year, day.month, day.day, hour) + timedelta(minutes=1)
     end_dt = start_dt + timedelta(days=1) - timedelta(minutes=1)
-    lines = collect_window(start_dt, end_dt)
+    raw = collect_window(start_dt, end_dt)
+    kept, dropped = [], 0
+    prev_text = None
+    for disp, text in raw:
+        if text == prev_text or is_noise_line(text):
+            dropped += 1
+            continue
+        prev_text = text
+        kept.append(disp)
+    log("[每日总结] 原始", len(raw), "条，过滤", dropped, "条噪音，有效", len(kept), "条")
     os.makedirs(SUMMARIES_DIR, exist_ok=True)
     out_path = os.path.join(SUMMARIES_DIR, os.path.basename(date_str + ".md"))
-    if not lines:
+    if not kept:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write("# " + date_str + " 语音日志总结\n\n（该时段无记录）\n")
         return out_path
-    transcript = "\n".join(lines)
-    if len(transcript) > 24000:
-        transcript = "…（更早内容已截断）\n" + transcript[-24000:]
+    chunks, cur, cur_len = [], [], 0
+    for disp in kept:
+        cur.append(disp)
+        cur_len += len(disp) + 1
+        if cur_len >= 20000:
+            chunks.append(cur)
+            cur, cur_len = [], 0
+    if cur:
+        chunks.append(cur)
     range_label = start_dt.strftime("%Y-%m-%d %H:%M") + " 至 " + end_dt.strftime("%Y-%m-%d %H:%M")
     try:
-        text = deepseek_summarize(cfg, range_label, transcript)
+        if len(chunks) == 1:
+            text = deepseek_summarize(cfg, range_label, "\n".join(chunks[0]))
+        else:
+            log("[每日总结] 有效内容较长，分", len(chunks), "段处理")
+            points = []
+            for i, ch in enumerate(chunks):
+                try:
+                    points.append(deepseek_summarize(cfg, range_label, "\n".join(ch), mode="points"))
+                except Exception as exc:
+                    log("[每日总结] 段", i + 1, "失败:", exc)
+            if not points:
+                raise RuntimeError("所有分段均失败")
+            text = deepseek_summarize(cfg, range_label, "\n\n".join(points), mode="combine")
     except Exception as exc:
         log("[每日总结] DeepSeek 调用失败:", exc)
-        text = "> 总结失败：" + str(exc) + "\n\n原始条数：" + str(len(lines))
+        text = "> 总结失败：" + str(exc)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("# " + date_str + " 语音日志总结\n\n范围：" + range_label +
-                " · 共 " + str(len(lines)) + " 条\n\n" + text + "\n")
+                " · 原始 " + str(len(raw)) + " 条 · 过滤 " + str(dropped) +
+                " 条 · 有效 " + str(len(kept)) + " 条\n\n" + text + "\n")
     log("[每日总结] 已写入", out_path)
     return out_path
 
