@@ -154,7 +154,7 @@ Windows 离线中文语音听写与环境记录工具：常态录音自动过滤
 
 - Alt+R 若被 NVIDIA App 的 Overlay 性能显示占用，会自动退回备用热键；要夺回 Alt+R 需先在 NVIDIA App 设置中关闭该快捷键
 - 断句静音、VAD 阈值、合并超时、热键、模型路径集中在 `monikavoice.py` 顶部（`DEFAULT_CONFIG` 与常量区），可自行调整
-- 记录模式下，不含句末标点的半句会持有最多 `merge_max_seconds`（默认 30 s）才落盘，属预期行为
+- 记录模式下，不含句末标点的半句会持有最多 `merge_max_seconds`（默认 45 s）才落盘，属预期行为；落盘精修在独立线程完成，不阻塞流式识别
 - `ctypes.SendInput` 的 INPUT 结构体在 64 位下必须按 40 字节对齐（ unions 按 MOUSEINPUT 取最大成员），否则按键会被系统静默丢弃——二次开发时注意
 
 ## License

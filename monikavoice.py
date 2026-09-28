@@ -54,7 +54,7 @@ HOTKEY_TOGGLE, HOTKEY_QUIT = 1, 2
 SAMPLE_RATE = 16000
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 MODEL_DIR = os.path.join(BASE, "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20")
 PUNCT_DIR = os.path.join(BASE, "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12")
 PARAFORMER_DIR = os.path.join(BASE, "sherpa-onnx-paraformer-zh-2023-09-14")
@@ -119,8 +119,8 @@ DEFAULT_CONFIG = {
     "end_silence_s": 0.4,       # 断句静音时长；ambient 未完句会自动合并，此值只影响断句粒度与上屏延迟
     "vad_enable": True,         # Silero VAD 人声门控：非人声段不精修、不落日志
     "vad_speech_ratio": 0.25,   # 段内人声窗口占比低于此值判定为环境噪音
-    "merge_max_seconds": 30.0,  # ambient 未完句最长持有音频（超时强制落盘）
-    "merge_gap_seconds": 6.0,   # ambient 静音超过该秒数，未完句先落盘
+    "merge_max_seconds": 45.0,  # ambient 未完句最长持有音频（超时强制落盘）
+    "merge_gap_seconds": 12.0,  # ambient 静音超过该秒数，未完句先落盘
     "speaker_allowlist_only": False,  # True 时 ambient 只保留命中已注册声纹的句子
 }
 
@@ -1660,6 +1660,41 @@ def main():
 
     capture = {"active": False, "buf": [], "need": 0, "done": threading.Event()}
 
+    # ambient 断句段 → finalize 工作线程：精修/合并/落盘不再阻塞流式解码，
+    # 停顿处写日志的同时新的语音照常识别
+    finalize_q = queue.Queue()
+    flush_done = threading.Event()  # 工作线程处理完 FLUSH 哨兵后置位
+
+    def refine_block(block):
+        """降噪 → 离线精修 → 标点，返回 (文本, 是否精修)。
+        模型对象与 HTTP 线程共享（transcribe/enroll），sherpa 不支持并发，须串行"""
+        text, refined = "", False
+        with model_lock:
+            if denoiser is not None:
+                try:
+                    block = denoiser.run(block, SAMPLE_RATE).samples
+                except Exception as exc:
+                    log("[降噪异常]", exc)
+            if refiner is not None and len(block) > SAMPLE_RATE // 2:
+                try:
+                    t0 = time.time()
+                    rs = refiner.create_stream()
+                    rs.accept_waveform(SAMPLE_RATE, np.asarray(block, dtype=np.float32))
+                    refiner.decode_stream(rs)
+                    refined_text = rs.result.text.strip()
+                    if refined_text:
+                        text = refined_text
+                        refined = True
+                    log("[精修]", round((time.time() - t0) * 1000), "ms:", text)
+                except Exception as exc:
+                    log("[精修异常，用流式结果]", exc)
+            if text and punct is not None:
+                try:
+                    text = punct.add_punctuation(text)
+                except Exception as exc:
+                    log("[标点异常]", exc)
+        return text, refined
+
     def mic_callback(indata, frames, time_info, status):
         audio_q.put(indata.copy())
         if capture["active"]:
@@ -1672,18 +1707,81 @@ def main():
                          blocksize=SAMPLE_RATE // 10, callback=mic_callback)
     mic.start()
 
+    def finalize_worker():
+        """ambient 断句段的精修/合并/落盘专用线程：
+        VAD 门槛 → 未完句合并整段重精修 → 出现终结标点才落日志。
+        独立成线程后，停顿处写日志（重精修可达 1-2 秒）期间 dictation 线程的
+        流式解码照常跑，新输入不会被卡住；写日志顺序与断句顺序一致（单线程消费）"""
+        merge_gap_s = float(cfg.get("merge_gap_seconds", 12.0))
+        merge_max_s = float(cfg.get("merge_max_seconds", 45.0))
+        vad_ratio_min = float(cfg.get("vad_speech_ratio", 0.25))
+        allowlist_only = bool(cfg.get("speaker_allowlist_only", False))
+        # 未完句持有状态：blocks[0]=已合并音频，text=最近一次精修+标点结果
+        pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0}
+
+        def pending_flush():
+            """把持有中的未完句落日志（用最近一次合并精修的文本，不再重算）"""
+            nonlocal pending
+            if not pending["blocks"]:
+                pending.update(samples=0, text="", updated=0.0)
+                return
+            audio = pending["blocks"][0]
+            spk = registry.label(audio)
+            speaker = spk[0] if spk and spk[0] else "未知"
+            if allowlist_only and speaker == "未知":
+                state["stats"]["unknown_dropped"] += 1
+                log("[白名单] 丢弃未注册来源句子:", pending["text"][:30])
+            elif pending["text"]:
+                voice_log(pending["text"], committed=False, speaker=speaker)
+                history.add("ambient", pending["text"], committed=False,
+                            refined=True, speaker=speaker)
+            pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0}
+
+        while True:
+            try:
+                job = finalize_q.get(timeout=0.5)
+            except queue.Empty:
+                # 静默期：未完句超过 merge_gap 秒先落盘，避免一直挂起
+                if pending["samples"] and time.time() - pending["updated"] > merge_gap_s:
+                    pending_flush()
+                continue
+            if job == "FLUSH":
+                pending_flush()
+                flush_done.set()
+                continue
+            try:
+                block = job["block"]
+                # VAD 人声门槛：段内人声占比过低 = 环境噪音，整段丢弃
+                if vad is not None and job["ratio"] < vad_ratio_min:
+                    state["stats"]["noise_dropped"] += 1
+                    continue
+                # 持有中的未完句已到上限：先落盘，避免合并音频无限增长
+                if pending["blocks"] and pending["samples"] >= merge_max_s * SAMPLE_RATE:
+                    pending_flush()
+                # 与持有中的未完句合并后整段重精修（纠正跨段切分造成的同音错字）
+                audio = np.concatenate(pending["blocks"] + [block]) if pending["blocks"] else block
+                text, refined = refine_block(audio)
+                if not text and pending["text"]:
+                    text = pending["text"]
+                if not text:
+                    text = job["partial"]
+                if not text:
+                    continue
+                pending = {"blocks": [audio], "samples": len(audio),
+                           "text": text, "updated": time.time()}
+                # 出现句末标点（或音频超长）才落日志；半句继续持有等下一段合并
+                if TERMINAL_RE.search(text) or pending["samples"] >= merge_max_s * SAMPLE_RATE:
+                    pending_flush()
+            except Exception as exc:
+                log("[ambient 落盘异常]", exc)
+                time.sleep(0.2)
+
     def dictation():
         s = recognizer.create_stream()
         last_partial = ""
         buf, buf_samples = [], 0  # 距上次断句的原始音频，供精修
         vad_carry = []            # 不足一个 VAD 窗口的余样
         seg_speech_windows = 0    # 当前段内检出人声的窗口数
-        merge_gap_s = float(cfg.get("merge_gap_seconds", 6.0))
-        merge_max_s = float(cfg.get("merge_max_seconds", 30.0))
-        vad_ratio_min = float(cfg.get("vad_speech_ratio", 0.25))
-        allowlist_only = bool(cfg.get("speaker_allowlist_only", False))
-        # ambient 未完句持有状态：blocks=已合并音频，text=最近一次精修+标点结果
-        pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0}
 
         def vad_feed(samples):
             """喂 VAD 并累计本段人声窗口数；返回本 chunk 是否检出人声"""
@@ -1709,54 +1807,6 @@ def main():
             vad_carry = [rest] if len(rest) else []
             return speech
 
-        def pending_flush():
-            """把持有中的未完句落日志（用最近一次合并精修的文本，不再重算）"""
-            nonlocal pending
-            if not pending["blocks"]:
-                pending.update(samples=0, text="", updated=0.0)
-                return
-            audio = pending["blocks"][0]
-            spk = registry.label(audio)
-            speaker = spk[0] if spk and spk[0] else "未知"
-            if allowlist_only and speaker == "未知":
-                state["stats"]["unknown_dropped"] += 1
-                log("[白名单] 丢弃未注册来源句子:", pending["text"][:30])
-            elif pending["text"]:
-                voice_log(pending["text"], committed=False, speaker=speaker)
-                history.add("ambient", pending["text"], committed=False,
-                            refined=True, speaker=speaker)
-            pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0}
-
-        def refine_block(block):
-            """降噪 → 离线精修 → 标点，返回 (文本, 是否精修)。
-            模型对象与 HTTP 线程共享（transcribe/enroll），sherpa 不支持并发，须串行"""
-            text, refined = "", False
-            with model_lock:
-                if denoiser is not None:
-                    try:
-                        block = denoiser.run(block, SAMPLE_RATE).samples
-                    except Exception as exc:
-                        log("[降噪异常]", exc)
-                if refiner is not None and len(block) > SAMPLE_RATE // 2:
-                    try:
-                        t0 = time.time()
-                        rs = refiner.create_stream()
-                        rs.accept_waveform(SAMPLE_RATE, np.asarray(block, dtype=np.float32))
-                        refiner.decode_stream(rs)
-                        refined_text = rs.result.text.strip()
-                        if refined_text:
-                            text = refined_text
-                            refined = True
-                        log("[精修]", round((time.time() - t0) * 1000), "ms:", text)
-                    except Exception as exc:
-                        log("[精修异常，用流式结果]", exc)
-                if text and punct is not None:
-                    try:
-                        text = punct.add_punctuation(text)
-                    except Exception as exc:
-                        log("[标点异常]", exc)
-            return text, refined
-
         def flush_inflight():
             """模式切换/退出时：正在录的半句截断，未完句一并落日志（只上 log 不上屏）"""
             nonlocal buf, buf_samples, last_partial, seg_speech_windows, vad_carry
@@ -1774,42 +1824,24 @@ def main():
             buf, buf_samples, last_partial = [], 0, ""
             seg_speech_windows = 0
             vad_carry = []
-            pending_flush()
+            # 让 finalize 工作线程把持有中的未完句落盘，等它确认（最多 3s）
+            flush_done.clear()
+            finalize_q.put("FLUSH")
+            flush_done.wait(timeout=3.0)
             recognizer.reset(s)
 
         def ambient_finalize(partial):
-            """记录模式断句：VAD 门槛 → 未完句合并重精修 → 出现终结标点才落日志。
-            解决固定 0.4s 断句把半句切碎（"输入"被拆成"初"+"呼入"）、标点按碎片硬加的问题"""
-            nonlocal buf, buf_samples, last_partial, seg_speech_windows, vad_carry, pending
+            """记录模式断句：只截取音频和 VAD 统计，精修/合并/落盘交给 finalize
+            工作线程——停顿处的重精修不再阻塞流式解码，新的输入照常识别"""
+            nonlocal buf, buf_samples, seg_speech_windows, vad_carry
             block = np.concatenate(buf) if buf else None
             ratio = min(1.0, seg_speech_windows * VAD_WINDOW / max(buf_samples, 1))
-            buf, buf_samples, last_partial = [], 0, ""
+            buf, buf_samples = [], 0
             seg_speech_windows = 0
             vad_carry = []
             recognizer.reset(s)
-            if block is None:
-                return
-            # VAD 人声门槛：段内人声占比过低 = 环境噪音，整段丢弃（不精修、不落日志）
-            if vad is not None and ratio < vad_ratio_min:
-                state["stats"]["noise_dropped"] += 1
-                return
-            # 持有中的未完句已到上限：先落盘，避免合并音频无限增长
-            if pending["blocks"] and pending["samples"] >= merge_max_s * SAMPLE_RATE:
-                pending_flush()
-            # 与持有中的未完句合并后整段重精修（纠正跨段切分造成的同音错字）
-            audio = np.concatenate(pending["blocks"] + [block]) if pending["blocks"] else block
-            text, refined = refine_block(audio)
-            if not text and pending["text"]:
-                text = pending["text"]
-            if not text:
-                text = partial
-            if not text:
-                return
-            pending = {"blocks": [audio], "samples": len(audio),
-                       "text": text, "updated": time.time()}
-            # 出现句末标点（或音频超长）才落日志；半句继续持有等下一段合并
-            if TERMINAL_RE.search(text) or pending["samples"] >= merge_max_s * SAMPLE_RATE:
-                pending_flush()
+            if block is not None:
+                finalize_q.put({"block": block, "partial": partial, "ratio": ratio})
 
         def commit(stream_text):
             """上屏模式断句：降噪+精修+同音替换+标点 → 声纹标注 → 上屏+log+历史"""
@@ -1838,11 +1870,7 @@ def main():
             try:
                 chunk = audio_q.get(timeout=0.1)
             except queue.Empty:
-                # 静默期：ambient 未完句超过 merge_gap 秒先落盘，避免一直挂起
-                if (state["mode"] != "commit" and pending["samples"]
-                        and time.time() - pending["updated"] > merge_gap_s):
-                    pending_flush()
-                continue
+                continue  # 静默期未完句的落盘由 finalize 工作线程按 merge_gap 处理
             try:
                 samples = chunk.reshape(-1)
                 vad_feed(samples)
@@ -1869,6 +1897,7 @@ def main():
                 except Exception:
                     s = recognizer.create_stream()
 
+    threading.Thread(target=finalize_worker, daemon=True).start()
     threading.Thread(target=dictation, daemon=True).start()
 
     def hotkey_worker():
@@ -1930,7 +1959,7 @@ def main():
         win.root.mainloop()
     finally:
         state["flush"].set()
-        time.sleep(1.0)  # 给识别线程留出截断上 log 的时间
+        time.sleep(3.0)  # 给识别线程截断 + finalize 线程落盘未完句留时间
         tid = hotkeys.get("tid")
         if tid:
             user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)

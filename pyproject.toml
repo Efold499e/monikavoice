@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "monikavoice"
-version = "0.2.0"
+version = "0.2.1"
 description = "Windows 离线中文语音听写：常态环境记录 + 热键上屏，VAD 人声门控与未完句合并，全程本地推理"
 readme = "README.md"
 requires-python = ">=3.9"
