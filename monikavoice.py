@@ -2,14 +2,16 @@
 """
 monikavoice —— Windows 离线中文语音听写（本地运行，无广告，不联网）
 
-- 常态录音：程序运行即持续监听麦克风，所有说到的话按时间写入 logs/voice-日期.log
-  与 history.jsonl（记录模式，不上屏）
+- 常态录音：程序运行即持续监听麦克风，Silero VAD 判定为人声的句子经
+  "离线 Paraformer 精修 + 同音替换纠错 + ct-transformer 标点"后按时间写入
+  logs/voice-日期.log 与 history.jsonl（记录模式，不上屏）；未完句自动与
+  下一段合并再精修，避免固定断句把半句话切错、标点打碎
 - 唤出上屏：Alt+R/Alt+T（被占用自动回退）切换到上屏模式，切换瞬间会把正在录的
-  半句截断、只上 log 不上屏；之后断句的内容经"离线 Paraformer 精修 + 同音替换
-  纠错 + ct-transformer 标点"打进当前焦点输入框；再次按热键收回记录模式
+  半句截断、只上 log 不上屏；之后断句的内容经同一管线打进当前焦点输入框；
+  再次按热键收回记录模式
 - 实时浮窗：仅上屏模式弹出，流式跟随识别内容，不抢目标应用焦点
 - 历史与 API：http://127.0.0.1:8397/ 网页查看；/api/history /api/status
-  /api/mode /api/transcribe（预留宿曜整理上课录音）等接口供 AI/程序调用
+  /api/mode /api/transcribe /api/session（宿曜上课长录音会话）等接口供 AI/程序调用
 - 每日任务：02:00 用 DeepSeek 总结前一天 02:01 起的全部内容到 summaries/；
   同时清理 6 个月前的历史与日志
 """
@@ -21,7 +23,10 @@ import math
 import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -49,22 +54,54 @@ HOTKEY_TOGGLE, HOTKEY_QUIT = 1, 2
 SAMPLE_RATE = 16000
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+VERSION = "0.2.0"
 MODEL_DIR = os.path.join(BASE, "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20")
 PUNCT_DIR = os.path.join(BASE, "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12")
 PARAFORMER_DIR = os.path.join(BASE, "sherpa-onnx-paraformer-zh-2023-09-14")
 HR_DIR = os.path.join(BASE, "hr")
 LOGS_DIR = os.path.join(BASE, "logs")
 SUMMARIES_DIR = os.path.join(BASE, "summaries")
+SESSIONS_DIR = os.path.join(BASE, "sessions")
 LOG_PATH = os.path.join(BASE, "monikavoice.log")
 HISTORY_PATH = os.path.join(BASE, "history.jsonl")
 CONFIG_PATH = os.path.join(BASE, "config.json")
 ICON64 = os.path.join(BASE, "icon64.png")
 SPEAKER_MODEL = os.path.join(BASE, "campplus.onnx")
 DENOISER_MODEL = os.path.join(BASE, "gtcrn_simple.onnx")
+VAD_MODEL = os.path.join(BASE, "silero_vad.onnx")
 SPEAKERS_JSON = os.path.join(BASE, "speakers.json")
 HTTP_PORT = 8397
 HISTORY_MAX = 2000
 RETAIN_DAYS = 183  # 六个月
+VAD_WINDOW = 512  # silero VAD 固定窗口（16kHz 下 32ms）
+
+# 句子终结标点：ambient 未完句会继续与下一段合并，直到出现终结标点才落盘
+TERMINAL_RE = re.compile(r"[。！？；…!?;.；]\s*[」”’》\]）)]*\s*$")
+
+# 转写接口接受的媒体格式（非 wav 走 ffmpeg 转 16k 单声道）
+AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus",
+              ".wma", ".mp4", ".mov", ".mkv", ".webm")
+
+# 推理模型互斥锁：dictation 线程与 HTTP 线程共享 refiner/punct/denoiser，
+# sherpa-onnx 对象不支持并发解码，必须串行
+model_lock = threading.Lock()
+
+# 会话（宿曜上课长录音）：全局状态，voice_log 钩子自动写入，HTTP 线程启停。
+# 文件名永远由字面量 "session-" + 纯时间戳拼出（用户标题只写进文件内容），
+# 每次写入都走 open/append/close，不保留跨线程的持久句柄
+SESSION = {"active": False, "title": "", "start": "", "stamp": "", "lines": 0, "parts": []}
+SESSION_LOCK = threading.Lock()
+
+
+def _session_append(line):
+    """会话转录追加一行（文件名不含任何用户输入）"""
+    name = os.path.basename("session-" + SESSION["stamp"] + ".md")
+    with open(os.path.join(SESSIONS_DIR, name), "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def _session_summary_path():
+    return os.path.join(SESSIONS_DIR, os.path.basename("session-" + SESSION["stamp"] + ".summary.md"))
 
 # 固定的 DeepSeek 开放接口：协议与主机白名单硬编码，请求前再校验一次
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
@@ -79,6 +116,12 @@ DEFAULT_CONFIG = {
     "speaker_enable": True,
     "speaker_threshold": 0.5,
     "auto_enroll_user": False,  # 上屏语音是否自动注册"我"（默认关，避免录错人；手动录入更可控）
+    "end_silence_s": 0.4,       # 断句静音时长；ambient 未完句会自动合并，此值只影响断句粒度与上屏延迟
+    "vad_enable": True,         # Silero VAD 人声门控：非人声段不精修、不落日志
+    "vad_speech_ratio": 0.25,   # 段内人声窗口占比低于此值判定为环境噪音
+    "merge_max_seconds": 30.0,  # ambient 未完句最长持有音频（超时强制落盘）
+    "merge_gap_seconds": 6.0,   # ambient 静音超过该秒数，未完句先落盘
+    "speaker_allowlist_only": False,  # True 时 ambient 只保留命中已注册声纹的句子
 }
 
 
@@ -103,15 +146,25 @@ def log(*args):
 
 def voice_log(text, committed, speaker=""):
     """语音内容按天落盘：logs/voice-YYYY-MM-DD.log
-    每行 [时间] [说话人] 标记 文本"""
+    每行 [时间] [说话人] 标记 文本。会话（上课录音）开启时同步写入会话转录"""
     try:
         os.makedirs(LOGS_DIR, exist_ok=True)
         name = os.path.basename("voice-" + time.strftime("%Y-%m-%d") + ".log")
         tag = "[" + speaker + "] " if speaker else ""
+        line = time.strftime("[%H:%M:%S] ") + tag + ("上屏 " if committed else "记录 ") + text + "\n"
         with open(os.path.join(LOGS_DIR, name), "a", encoding="utf-8") as f:
-            f.write(time.strftime("[%H:%M:%S] ") + tag + ("上屏 " if committed else "记录 ") + text + "\n")
+            f.write(line)
     except OSError as exc:
         log("语音日志写入失败:", exc)
+        return
+    if SESSION["active"]:
+        try:
+            tag = "[" + speaker + "] " if speaker else ""
+            _session_append(time.strftime("[%H:%M:%S] ") + tag + text + "\n")
+            SESSION["lines"] += 1
+            SESSION["parts"].append(text)
+        except OSError as exc:
+            log("会话转录写入失败:", exc)
 
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -263,7 +316,7 @@ def send_text(text):
 
 # ---------------- 模型加载 ----------------
 
-def build_recognizer():
+def build_recognizer(cfg):
     files = {}
     for key, pat in (("encoder", "*encoder*.onnx"), ("decoder", "*decoder*.onnx"),
                      ("joiner", "*joiner*.onnx"), ("tokens", "*tokens.txt")):
@@ -283,7 +336,7 @@ def build_recognizer():
         feature_dim=80,
         decoding_method="modified_beam_search",
         enable_endpoint_detection=True,
-        rule2_min_trailing_silence=0.4,
+        rule2_min_trailing_silence=float(cfg.get("end_silence_s", 0.4)),
         rule3_min_utterance_length=20.0,
     )
 
@@ -349,6 +402,31 @@ def load_denoiser():
         return None
 
 
+def load_vad(cfg):
+    """Silero VAD 人声检测：只用作"该段是否人声"的门槛（清噪不辨义 → VAD 辨声不辨义），
+    不改变流式断句逻辑。加载失败则退回无门控（行为同 0.1.x）"""
+    if not cfg.get("vad_enable", True):
+        log("VAD 人声门控未启用（vad_enable=false）")
+        return None
+    if not os.path.isfile(VAD_MODEL):
+        log("VAD 模型缺失(silero_vad.onnx)，人声门控关闭，环境音会照常进入识别")
+        return None
+    try:
+        vcfg = sherpa_onnx.VadModelConfig(
+            silero_vad=sherpa_onnx.SileroVadModelConfig(
+                model=VAD_MODEL, threshold=0.5, min_silence_duration=0.25,
+                min_speech_duration=0.25, max_speech_duration=20.0,
+                window_size=VAD_WINDOW),
+            sample_rate=SAMPLE_RATE, num_threads=1)
+        vad = sherpa_onnx.VoiceActivityDetector(vcfg, buffer_size_in_seconds=30)
+        log("VAD 人声门控(Silero)已加载，人声占比阈值:",
+            cfg.get("vad_speech_ratio", 0.25))
+        return vad
+    except Exception as exc:
+        log("VAD 加载失败，人声门控关闭:", exc)
+        return None
+
+
 class SpeakerRegistry:
     """声纹识别：注册过的说话人（自动从上屏模式采集"我"）优先匹配，
     未匹配的按余弦相似度聚成"他人N"。speakers.json 存声纹特征（含生物特征，勿外传）"""
@@ -376,6 +454,7 @@ class SpeakerRegistry:
         self.others = {}   # name -> centroid(list[float])
         self.next_other = 1
         self.lock = threading.Lock()
+        self.embed_lock = threading.Lock()  # 声纹 extractor 不支持并发，HTTP 与听写线程共用
         if not self.enabled:
             log("声纹识别关闭（缺模型或配置禁用）")
             return
@@ -428,12 +507,13 @@ class SpeakerRegistry:
     def _embed(self, samples):
         if self.extractor is None or len(samples) < SAMPLE_RATE * self.MIN_SAMPLES:
             return None
-        st = self.extractor.create_stream()
-        st.accept_waveform(SAMPLE_RATE, np.asarray(samples, dtype=np.float32))
-        st.input_finished()
-        emb = []
-        while self.extractor.is_ready(st):
-            emb = self.extractor.compute(st)
+        with self.embed_lock:
+            st = self.extractor.create_stream()
+            st.accept_waveform(SAMPLE_RATE, np.asarray(samples, dtype=np.float32))
+            st.input_finished()
+            emb = []
+            while self.extractor.is_ready(st):
+                emb = self.extractor.compute(st)
         return emb if emb else None
 
     @staticmethod
@@ -581,12 +661,13 @@ class SpeakerRegistry:
 # ---------------- 文件转写（宿曜预留） ----------------
 
 def safe_media_path(path):
-    """转写文件路径校验：真实路径、必须是 .wav、禁止系统目录"""
+    """转写文件路径校验：真实路径、必须是常见音视频格式、禁止系统目录。
+    非 wav 的格式由 _ensure_wav 借助 ffmpeg 转换"""
     if not path or not os.path.isabs(path):
         raise ValueError("需要绝对路径")
     p = os.path.realpath(os.path.abspath(path))
-    if not p.lower().endswith(".wav"):
-        raise ValueError("仅支持 .wav 文件")
+    if not p.lower().endswith(AUDIO_EXTS):
+        raise ValueError("不支持的格式，可选: " + " ".join(AUDIO_EXTS))
     if not os.path.isfile(p):
         raise ValueError("文件不存在")
     blocked_roots = [os.environ.get("WINDIR", r"C:\Windows"),
@@ -596,6 +677,24 @@ def safe_media_path(path):
         if root and p.lower().startswith(os.path.realpath(root).lower() + os.sep):
             raise ValueError("不允许访问系统目录")
     return p
+
+
+def _ensure_wav(path):
+    """非 wav 输入用 ffmpeg 转 16k 单声道 pcm 到临时目录；wav 原样返回"""
+    if path.lower().endswith(".wav"):
+        return path, None
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise ValueError("文件不是 .wav 且系统未安装 ffmpeg，无法转换")
+    stamp = str(int(time.time() * 1000))
+    out = os.path.join(tempfile.gettempdir(), "monikavoice-tc-" + stamp + ".wav")
+    proc = subprocess.run(
+        [ffmpeg, "-y", "-i", path, "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE),
+         "-c:a", "pcm_s16le", out],
+        capture_output=True, timeout=1800)
+    if proc.returncode != 0 or not os.path.isfile(out):
+        raise ValueError("ffmpeg 转换失败: " + proc.stderr.decode("utf-8", "ignore")[-400:])
+    return out, out  # (使用路径, 待清理路径)
 
 
 def _read_wav_mono16k(path):
@@ -625,32 +724,82 @@ def _read_wav_mono16k(path):
     return data
 
 
-def transcribe_file(path, refiner, punct, denoiser=None, registry=None, log_it=True):
-    """转写音频文件：降噪 → 30 秒分段 → Paraformer+同音替换+标点，
-    每段带声纹来源标注。返回 (拼接文本, 分段列表)"""
+def _vad_split(data, vad_cfg):
+    """用独立 VAD 实例把整段音频切成人声片段（避开长静音与纯噪音），
+    返回 [float32 数组]。失败返回空列表（调用方回退固定窗口）"""
+    try:
+        vad = sherpa_onnx.VoiceActivityDetector(vad_cfg, buffer_size_in_seconds=120)
+    except Exception as exc:
+        log("[转写] VAD 初始化失败，退回固定窗口:", exc)
+        return []
+    segs = []
+    pos = 0
+    n = len(data)
+    while pos < n:
+        chunk = np.asarray(data[pos:pos + SAMPLE_RATE // 2], dtype=np.float32)  # 0.5s 一喂
+        vad.accept_waveform(chunk)
+        pos += len(chunk)
+        while not vad.empty():
+            seg = vad.front
+            vad.pop()
+            if seg.samples is not None and len(seg.samples) > SAMPLE_RATE // 4:
+                segs.append(np.asarray(seg.samples, dtype=np.float32))
+    try:
+        vad.flush()
+        while not vad.empty():
+            seg = vad.front
+            vad.pop()
+            if seg.samples is not None and len(seg.samples) > SAMPLE_RATE // 4:
+                segs.append(np.asarray(seg.samples, dtype=np.float32))
+    except Exception:
+        pass
+    return segs
+
+
+def transcribe_file(path, refiner, punct, denoiser=None, registry=None, log_it=True,
+                    vad_cfg=None):
+    """转写音频文件（宿曜上课录音用，支持数小时长文件）：
+    有 VAD 时按人声段切分（识别边界干净），否则固定 30 秒窗口；
+    每段降噪 → Paraformer+同音替换 → 标点 → 声纹标注。返回 (拼接文本, 分段列表)"""
     if refiner is None:
         raise RuntimeError("离线精修模型未加载")
-    data = _read_wav_mono16k(path)
-    step = SAMPLE_RATE * 30
+    src, cleanup = _ensure_wav(path)
+    try:
+        data = _read_wav_mono16k(src)
+    finally:
+        if cleanup:
+            try:
+                os.remove(cleanup)
+            except OSError:
+                pass
+    if vad_cfg is not None:
+        chunks = _vad_split(data, vad_cfg)
+        log("[转写] VAD 切分:", len(chunks), "个人声段 / 共",
+            round(len(data) / SAMPLE_RATE / 60.0, 1), "分钟")
+    else:
+        chunks = []
+    if not chunks:
+        step = SAMPLE_RATE * 30
+        chunks = [np.asarray(data[i:i + step], dtype=np.float32)
+                  for i in range(0, max(1, len(data)), step)]
+        chunks = [c for c in chunks if len(c) > SAMPLE_RATE // 10]
     texts, segs = [], []
-    for i in range(0, max(1, len(data)), step):
-        seg = data[i:i + step]
-        if len(seg) < SAMPLE_RATE // 10:
-            break
-        if denoiser is not None:
-            try:
-                seg = denoiser.run(seg, SAMPLE_RATE).samples
-            except Exception:
-                pass
-        rs = refiner.create_stream()
-        rs.accept_waveform(SAMPLE_RATE, np.asarray(seg, dtype=np.float32))
-        refiner.decode_stream(rs)
-        t = rs.result.text.strip()
-        if t and punct is not None:
-            try:
-                t = punct.add_punctuation(t)
-            except Exception:
-                pass
+    for seg in chunks:
+        with model_lock:
+            if denoiser is not None:
+                try:
+                    seg = denoiser.run(seg, SAMPLE_RATE).samples
+                except Exception:
+                    pass
+            rs = refiner.create_stream()
+            rs.accept_waveform(SAMPLE_RATE, np.asarray(seg, dtype=np.float32))
+            refiner.decode_stream(rs)
+            t = rs.result.text.strip()
+            if t and punct is not None:
+                try:
+                    t = punct.add_punctuation(t)
+                except Exception:
+                    pass
         if t:
             spk = registry.label(seg) if registry else ("", 0)
             spk_name = spk[0] if spk and spk[0] else "未知"
@@ -662,7 +811,39 @@ def transcribe_file(path, refiner, punct, denoiser=None, registry=None, log_it=T
     return "".join(texts), segs
 
 
-# ---------------- 每日任务：DeepSeek 总结 + 六个月清理 ----------------
+# ---------------- 会话：宿曜上课长录音（启停接口 + 会话总结） ----------------
+
+def session_start(title):
+    """开启一个会话：此后所有落日志的语音（ambient/上屏/转写）同步写入
+    sessions/session-<时间戳>.md，标题写在文件首行。返回会话信息 dict"""
+    with SESSION_LOCK:
+        if SESSION["active"]:
+            raise RuntimeError("已有会话进行中: " + SESSION["title"])
+        SESSION.update({"active": True, "title": (title or "").strip()[:60] or "未命名",
+                        "stamp": time.strftime("%Y%m%d-%H%M%S"),
+                        "start": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "lines": 0, "parts": []})
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        _session_append("# 会话转录：" + SESSION["title"] +
+                        "\n\n开始：" + SESSION["start"] + "\n\n")
+        log("[会话] 开始:", SESSION["title"], "->", "session-" + SESSION["stamp"] + ".md")
+        return session_status()
+
+
+def session_stop(cfg=None, summarize=False):
+    """结束会话。summarize=True 时由 HTTP 层再调 session_summarize 提炼要点"""
+    with SESSION_LOCK:
+        if not SESSION["active"]:
+            raise RuntimeError("没有进行中的会话")
+        title, lines = SESSION["title"], SESSION["lines"]
+        SESSION["active"] = False
+        _session_append("\n结束：" + time.strftime("%Y-%m-%d %H:%M:%S") +
+                        " · 共 " + str(lines) + " 条\n")
+        parts = list(SESSION.get("parts") or [])
+        log("[会话] 结束:", title, "共", lines, "条")
+    if summarize and parts:
+        return {"summarize_pending_parts": len(parts)}
+    return {}
 
 LINE_RE = re.compile(r"\[(\d\d:\d\d:\d\d)\] (?:\[(?P<spk>[^\]]+)\] )?(?P<mark>上屏 |记录 |截断 )?(?P<text>.*)$")
 
@@ -762,6 +943,58 @@ def deepseek_summarize(cfg, range_label, transcript, mode="full"):
     with _guarded_urlopen(req, timeout=180) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"]
+
+
+def session_status():
+    return {"active": SESSION["active"], "title": SESSION["title"],
+            "start": SESSION["start"], "lines": SESSION["lines"],
+            "file": ("session-" + SESSION["stamp"] + ".md") if SESSION["active"] else ""}
+
+
+def list_sessions():
+    out = []
+    if os.path.isdir(SESSIONS_DIR):
+        for p in sorted(glob.glob(os.path.join(SESSIONS_DIR, "*.md"))):
+            try:
+                out.append({"file": os.path.basename(p),
+                            "size": os.path.getsize(p),
+                            "mtime": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                   time.localtime(os.path.getmtime(p)))})
+            except OSError:
+                continue
+    return out
+
+
+def session_summarize(cfg):
+    """把最近结束的会话内容交给 DeepSeek 提炼要点，追加写入会话转录文件尾部。
+    返回要点文本（失败时返回错误说明）"""
+    parts = list(SESSION.get("parts") or [])
+    if not parts:
+        return "（会话无有效内容）"
+    label = "会话「" + SESSION["title"] + "」 " + SESSION["start"]
+    try:
+        if len("".join(parts)) <= 20000:
+            text = deepseek_summarize(cfg, label, "\n".join(parts), mode="points")
+        else:
+            chunks, cur, cur_len = [], [], 0
+            for p in parts:
+                cur.append(p)
+                cur_len += len(p) + 1
+                if cur_len >= 20000:
+                    chunks.append(cur)
+                    cur, cur_len = [], 0
+            if cur:
+                chunks.append(cur)
+            log("[会话] 内容较长，分", len(chunks), "段提炼")
+            points = [deepseek_summarize(cfg, label, "\n".join(ch), mode="points")
+                      for ch in chunks]
+            text = deepseek_summarize(cfg, label, "\n\n".join(points), mode="combine")
+    except Exception as exc:
+        log("[会话] 总结失败:", exc)
+        text = "> 总结失败：" + str(exc)
+    _session_append("\n## 要点\n\n" + text + "\n")
+    log("[会话] 要点已追加至 session-" + SESSION["stamp"] + ".md")
+    return text
 
 
 def summarize_for_date(date_str, cfg, store):
@@ -1056,7 +1289,9 @@ PAGE_HTML = """<!doctype html>
 <div class="api">
  API：<code>GET /api/history?limit=100&amp;since_id=0</code> ·
  <code>GET /api/status</code> · <code>GET /api/summary?date=YYYY-MM-DD</code> ·
- <code>POST /api/mode /api/clear /api/summarize /api/transcribe</code>
+ <code>POST /api/mode /api/clear /api/summarize /api/transcribe</code> ·
+ <code>POST /api/session/start</code>{"title"} · <code>POST /api/session/stop</code>{"summarize":true} ·
+ <code>GET /api/sessions</code>
  （仅本机 127.0.0.1 可访问；配置 api_token 后 POST 需带 X-Token 头）
 </div>
 <script>
@@ -1128,7 +1363,7 @@ class HistoryServer:
     """仅绑定 127.0.0.1 的历史查询/模式控制/文件转写/总结接口"""
 
     def __init__(self, store, state, hotkeys, ui_q, refiner, punct, cfg,
-                 denoiser=None, registry=None, capture=None):
+                 denoiser=None, registry=None, capture=None, vad_cfg=None):
         self.store = store
         self.state = state
         self.hotkeys = hotkeys
@@ -1139,6 +1374,7 @@ class HistoryServer:
         self.denoiser = denoiser
         self.registry = registry
         self.capture = capture or {}
+        self.vad_cfg = vad_cfg
         self.token = (cfg.get("api_token") or "").strip()
         hs = self  # Handler 内通过闭包访问服务端状态（self 已被 Handler 实例占用）
 
@@ -1176,7 +1412,15 @@ class HistoryServer:
                                      "hotkey": hotkeys.get("name"),
                                      "total": total,
                                      "denoise": denoiser is not None,
-                                     "speaker": bool(registry and registry.enabled)})
+                                     "speaker": bool(registry and registry.enabled),
+                                     "vad": vad_cfg is not None,
+                                     "version": VERSION,
+                                     "stats": dict(state.get("stats") or {}),
+                                     "session": session_status()})
+                elif u.path == "/api/session/status":
+                    self._json(200, session_status())
+                elif u.path == "/api/sessions":
+                    self._json(200, {"items": list_sessions()})
                 elif u.path == "/api/summary":
                     q = parse_qs(u.query)
                     date = q.get("date", [time.strftime("%Y-%m-%d")])[0]
@@ -1245,10 +1489,11 @@ class HistoryServer:
                     try:
                         samples = _read_wav_mono16k(p)
                         if denoiser is not None:
-                            try:
-                                samples = denoiser.run(samples, SAMPLE_RATE).samples
-                            except Exception:
-                                pass
+                            with model_lock:
+                                try:
+                                    samples = denoiser.run(samples, SAMPLE_RATE).samples
+                                except Exception:
+                                    pass
                         count, is_new = registry.enroll_speaker(name, samples) if registry \
                             else (0, False)
                         self._json(200, {"ok": bool(count), "name": name,
@@ -1264,10 +1509,11 @@ class HistoryServer:
                     try:
                         samples = _read_wav_mono16k(p)
                         if denoiser is not None:
-                            try:
-                                samples = denoiser.run(samples, SAMPLE_RATE).samples
-                            except Exception:
-                                pass
+                            with model_lock:
+                                try:
+                                    samples = denoiser.run(samples, SAMPLE_RATE).samples
+                                except Exception:
+                                    pass
                         name, sim, scores = registry.who(samples) if registry \
                             else ("未知", 0.0, {})
                         self._json(200, {"ok": True, "speaker": name,
@@ -1285,10 +1531,11 @@ class HistoryServer:
                         self._json(409, {"ok": False, "error": str(exc)})
                         return
                     if denoiser is not None:
-                        try:
-                            samples = denoiser.run(samples, SAMPLE_RATE).samples
-                        except Exception:
-                            pass
+                        with model_lock:
+                            try:
+                                samples = denoiser.run(samples, SAMPLE_RATE).samples
+                            except Exception:
+                                pass
                     count, is_new = registry.enroll_speaker(name, samples) if registry \
                         else (0, False)
                     self._json(200, {"ok": bool(count), "name": name,
@@ -1300,10 +1547,11 @@ class HistoryServer:
                         self._json(409, {"ok": False, "error": str(exc)})
                         return
                     if denoiser is not None:
-                        try:
-                            samples = denoiser.run(samples, SAMPLE_RATE).samples
-                        except Exception:
-                            pass
+                        with model_lock:
+                            try:
+                                samples = denoiser.run(samples, SAMPLE_RATE).samples
+                            except Exception:
+                                pass
                     name, sim, scores = registry.who(samples) if registry \
                         else ("未知", 0.0, {})
                     self._json(200, {"ok": True, "speaker": name,
@@ -1342,11 +1590,29 @@ class HistoryServer:
                         text, segs = transcribe_file(
                             p, refiner, punct, denoiser=denoiser,
                             registry=registry,
-                            log_it=bool(payload.get("log", True)))
+                            log_it=bool(payload.get("log", True)),
+                            vad_cfg=hs.vad_cfg)
                         store.add("transcribe", text, committed=False,
                                   refined=True, speaker="多段" if len(segs) > 1 else (segs[0]["speaker"] if segs else "未知"))
                         self._json(200, {"ok": True, "text": text,
                                          "chars": len(text), "segments": segs})
+                    except Exception as exc:
+                        self._json(500, {"ok": False, "error": str(exc)})
+                elif u.path == "/api/session/start":
+                    try:
+                        info = session_start(payload.get("title", ""))
+                        self._json(200, {"ok": True, **info})
+                    except RuntimeError as exc:
+                        self._json(409, {"ok": False, "error": str(exc)})
+                elif u.path == "/api/session/stop":
+                    try:
+                        info = session_stop(cfg)
+                        summary = ""
+                        if payload.get("summarize") and cfg.get("deepseek_api_key"):
+                            summary = session_summarize(cfg)
+                        self._json(200, {"ok": True, **info, "summary": summary})
+                    except RuntimeError as exc:
+                        self._json(409, {"ok": False, "error": str(exc)})
                     except Exception as exc:
                         self._json(500, {"ok": False, "error": str(exc)})
                 else:
@@ -1374,19 +1640,21 @@ def main():
     cfg = load_config()
     if not cfg.get("deepseek_api_key"):
         log("[每日总结] 未配置 deepseek_api_key（config.json），总结功能停用")
-    recognizer = build_recognizer()
+    recognizer = build_recognizer(cfg)
     refiner = load_offline_refiner()
     punct = load_punctuation()
     denoiser = load_denoiser() if cfg.get("denoise_enable", True) else None
     if denoiser is None:
         log("人声增强未启用")
+    vad = load_vad(cfg)
     registry = SpeakerRegistry(cfg)
     if not cfg.get("auto_enroll_user", False):
         log("声纹自动注册已关闭（上屏语音不再自动采集；手动录入不受影响）")
 
     audio_q = queue.Queue()
     ui_q = queue.Queue()
-    state = {"mode": "ambient", "flush": threading.Event()}  # 常态=记录模式
+    state = {"mode": "ambient", "flush": threading.Event(),  # 常态=记录模式
+             "stats": {"noise_dropped": 0, "unknown_dropped": 0}}
     hotkeys = {}
     history = HistoryStore(HISTORY_PATH)
 
@@ -1408,50 +1676,140 @@ def main():
         s = recognizer.create_stream()
         last_partial = ""
         buf, buf_samples = [], 0  # 距上次断句的原始音频，供精修
+        vad_carry = []            # 不足一个 VAD 窗口的余样
+        seg_speech_windows = 0    # 当前段内检出人声的窗口数
+        merge_gap_s = float(cfg.get("merge_gap_seconds", 6.0))
+        merge_max_s = float(cfg.get("merge_max_seconds", 30.0))
+        vad_ratio_min = float(cfg.get("vad_speech_ratio", 0.25))
+        allowlist_only = bool(cfg.get("speaker_allowlist_only", False))
+        # ambient 未完句持有状态：blocks=已合并音频，text=最近一次精修+标点结果
+        pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0}
+
+        def vad_feed(samples):
+            """喂 VAD 并累计本段人声窗口数；返回本 chunk 是否检出人声"""
+            nonlocal vad_carry, seg_speech_windows
+            if vad is None:
+                return True
+            vad_carry.append(samples)
+            total = sum(len(x) for x in vad_carry)
+            if total < VAD_WINDOW:
+                return bool(seg_speech_windows)
+            data = np.concatenate(vad_carry)
+            n_win = len(data) // VAD_WINDOW
+            speech = False
+            for i in range(n_win):
+                vad.accept_waveform(np.asarray(data[i * VAD_WINDOW:(i + 1) * VAD_WINDOW],
+                                               dtype=np.float32))
+                while not vad.empty():
+                    vad.pop()
+                if vad.is_speech_detected():
+                    seg_speech_windows += 1
+                    speech = True
+            rest = data[n_win * VAD_WINDOW:]
+            vad_carry = [rest] if len(rest) else []
+            return speech
+
+        def pending_flush():
+            """把持有中的未完句落日志（用最近一次合并精修的文本，不再重算）"""
+            nonlocal pending
+            if not pending["blocks"]:
+                pending.update(samples=0, text="", updated=0.0)
+                return
+            audio = pending["blocks"][0]
+            spk = registry.label(audio)
+            speaker = spk[0] if spk and spk[0] else "未知"
+            if allowlist_only and speaker == "未知":
+                state["stats"]["unknown_dropped"] += 1
+                log("[白名单] 丢弃未注册来源句子:", pending["text"][:30])
+            elif pending["text"]:
+                voice_log(pending["text"], committed=False, speaker=speaker)
+                history.add("ambient", pending["text"], committed=False,
+                            refined=True, speaker=speaker)
+            pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0}
 
         def refine_block(block):
-            """降噪 → 离线精修 → 标点，返回 (文本, 是否精修)"""
+            """降噪 → 离线精修 → 标点，返回 (文本, 是否精修)。
+            模型对象与 HTTP 线程共享（transcribe/enroll），sherpa 不支持并发，须串行"""
             text, refined = "", False
-            if denoiser is not None:
-                try:
-                    block = denoiser.run(block, SAMPLE_RATE).samples
-                except Exception as exc:
-                    log("[降噪异常]", exc)
-            if refiner is not None and len(block) > SAMPLE_RATE // 2:
-                try:
-                    t0 = time.time()
-                    rs = refiner.create_stream()
-                    rs.accept_waveform(SAMPLE_RATE, np.asarray(block, dtype=np.float32))
-                    refiner.decode_stream(rs)
-                    refined_text = rs.result.text.strip()
-                    if refined_text:
-                        text = refined_text
-                        refined = True
-                    log("[精修]", round((time.time() - t0) * 1000), "ms:", text)
-                except Exception as exc:
-                    log("[精修异常，用流式结果]", exc)
-            if text and punct is not None:
-                try:
-                    text = punct.add_punctuation(text)
-                except Exception as exc:
-                    log("[标点异常]", exc)
+            with model_lock:
+                if denoiser is not None:
+                    try:
+                        block = denoiser.run(block, SAMPLE_RATE).samples
+                    except Exception as exc:
+                        log("[降噪异常]", exc)
+                if refiner is not None and len(block) > SAMPLE_RATE // 2:
+                    try:
+                        t0 = time.time()
+                        rs = refiner.create_stream()
+                        rs.accept_waveform(SAMPLE_RATE, np.asarray(block, dtype=np.float32))
+                        refiner.decode_stream(rs)
+                        refined_text = rs.result.text.strip()
+                        if refined_text:
+                            text = refined_text
+                            refined = True
+                        log("[精修]", round((time.time() - t0) * 1000), "ms:", text)
+                    except Exception as exc:
+                        log("[精修异常，用流式结果]", exc)
+                if text and punct is not None:
+                    try:
+                        text = punct.add_punctuation(text)
+                    except Exception as exc:
+                        log("[标点异常]", exc)
             return text, refined
 
         def flush_inflight():
-            """模式切换/退出时：正在录的半句截断，加标点后只上 log 不上屏"""
-            nonlocal buf, buf_samples, last_partial
+            """模式切换/退出时：正在录的半句截断，未完句一并落日志（只上 log 不上屏）"""
+            nonlocal buf, buf_samples, last_partial, seg_speech_windows, vad_carry
             if last_partial:
                 text = last_partial
-                if punct is not None:
-                    try:
-                        text = punct.add_punctuation(text)
-                    except Exception:
-                        pass
+                with model_lock:
+                    if punct is not None:
+                        try:
+                            text = punct.add_punctuation(text)
+                        except Exception:
+                            pass
                 voice_log(text, committed=False, speaker="截断")
                 history.add("flush", text, committed=False, refined=False, speaker="截断")
                 ui_q.put(("partial", ""))
             buf, buf_samples, last_partial = [], 0, ""
+            seg_speech_windows = 0
+            vad_carry = []
+            pending_flush()
             recognizer.reset(s)
+
+        def ambient_finalize(partial):
+            """记录模式断句：VAD 门槛 → 未完句合并重精修 → 出现终结标点才落日志。
+            解决固定 0.4s 断句把半句切碎（"输入"被拆成"初"+"呼入"）、标点按碎片硬加的问题"""
+            nonlocal buf, buf_samples, last_partial, seg_speech_windows, vad_carry, pending
+            block = np.concatenate(buf) if buf else None
+            ratio = min(1.0, seg_speech_windows * VAD_WINDOW / max(buf_samples, 1))
+            buf, buf_samples, last_partial = [], 0, ""
+            seg_speech_windows = 0
+            vad_carry = []
+            recognizer.reset(s)
+            if block is None:
+                return
+            # VAD 人声门槛：段内人声占比过低 = 环境噪音，整段丢弃（不精修、不落日志）
+            if vad is not None and ratio < vad_ratio_min:
+                state["stats"]["noise_dropped"] += 1
+                return
+            # 持有中的未完句已到上限：先落盘，避免合并音频无限增长
+            if pending["blocks"] and pending["samples"] >= merge_max_s * SAMPLE_RATE:
+                pending_flush()
+            # 与持有中的未完句合并后整段重精修（纠正跨段切分造成的同音错字）
+            audio = np.concatenate(pending["blocks"] + [block]) if pending["blocks"] else block
+            text, refined = refine_block(audio)
+            if not text and pending["text"]:
+                text = pending["text"]
+            if not text:
+                text = partial
+            if not text:
+                return
+            pending = {"blocks": [audio], "samples": len(audio),
+                       "text": text, "updated": time.time()}
+            # 出现句末标点（或音频超长）才落日志；半句继续持有等下一段合并
+            if TERMINAL_RE.search(text) or pending["samples"] >= merge_max_s * SAMPLE_RATE:
+                pending_flush()
 
         def commit(stream_text):
             """上屏模式断句：降噪+精修+同音替换+标点 → 声纹标注 → 上屏+log+历史"""
@@ -1480,9 +1838,14 @@ def main():
             try:
                 chunk = audio_q.get(timeout=0.1)
             except queue.Empty:
+                # 静默期：ambient 未完句超过 merge_gap 秒先落盘，避免一直挂起
+                if (state["mode"] != "commit" and pending["samples"]
+                        and time.time() - pending["updated"] > merge_gap_s):
+                    pending_flush()
                 continue
             try:
                 samples = chunk.reshape(-1)
+                vad_feed(samples)
                 buf.append(samples)
                 buf_samples += len(samples)
                 s.accept_waveform(SAMPLE_RATE, samples)
@@ -1497,22 +1860,7 @@ def main():
                     if state["mode"] == "commit":
                         commit(partial)
                     else:
-                        # 记录模式：降噪+精修+标点+声纹标注，只进日志不上屏
-                        block = np.concatenate(buf) if buf else None
-                        if block is not None or partial:
-                            text, refined = ("", False)
-                            if block is not None:
-                                text, refined = refine_block(block)
-                            if not text:
-                                text = partial
-                            spk = registry.label(block) if block is not None else ("未知", 0)
-                            speaker = spk[0] if spk and spk[0] else "未知"
-                            if text:
-                                voice_log(text, committed=False, speaker=speaker)
-                                history.add("ambient", text, committed=False,
-                                            refined=refined, speaker=speaker)
-                        buf, buf_samples, last_partial = [], 0, ""
-                        recognizer.reset(s)
+                        ambient_finalize(partial)
             except Exception as exc:
                 log("[识别/上屏异常]", exc)
                 time.sleep(0.1)
@@ -1550,7 +1898,7 @@ def main():
     threading.Thread(target=hotkey_worker, daemon=True).start()
 
     HistoryServer(history, state, hotkeys, ui_q, refiner, punct, cfg,
-                  denoiser, registry, capture).start()
+                  denoiser, registry, capture, vad_cfg=None if vad is None else vad.config).start()
 
     # 托盘图标：左键=唤出/收起上屏，右键=菜单
     def _tray_toggle(icon, item):

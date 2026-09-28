@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monikavoice"
+version = "0.2.0"
+description = "Windows 离线中文语音听写：常态环境记录 + 热键上屏，VAD 人声门控与未完句合并，全程本地推理"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Efold499e" }]
+keywords = [
+    "asr", "speech-recognition", "dictation", "voice-input",
+    "offline", "chinese", "sherpa-onnx", "windows", "vad",
+]
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "sherpa-onnx>=1.10",
+    "numpy",
+    "sounddevice",
+    "pystray",
+    "pillow",
+]
+
+[project.urls]
+Repository = "https://github.com/Efold499e/monikavoice"
+Bug Tracker = "https://github.com/Efold499e/monikavoice/issues"
+
+[project.scripts]
+monikavoice = "monikavoice:main"
+
+[tool.setuptools]
+py-modules = ["monikavoice"]

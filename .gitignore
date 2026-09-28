@@ -29,3 +29,9 @@ campplus.onnx
 gtcrn_simple.onnx
 speakers.json
 test_sr_denoise.py
+
+# VAD 人声门控模型（见 README 下载）
+silero_vad.onnx
+
+# 会话转录（宿曜上课长录音）
+sessions/
