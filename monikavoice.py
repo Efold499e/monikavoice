@@ -122,6 +122,7 @@ DEFAULT_CONFIG = {
     "merge_max_seconds": 45.0,  # ambient 未完句最长持有音频（超时强制落盘）
     "merge_gap_seconds": 12.0,  # ambient 静音超过该秒数，未完句先落盘
     "speaker_allowlist_only": False,  # True 时 ambient 只保留命中已注册声纹的句子
+    "course_teachers": {},  # 课程名子串 -> [老师名]：会话没显式传 teachers 时按标题兜底绑定声纹
 }
 
 
@@ -521,36 +522,160 @@ class SpeakerRegistry:
         u, v = np.asarray(u), np.asarray(v)
         return float(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v) + 1e-9))
 
-    def label(self, samples):
+    @classmethod
+    def _dominant_cluster(cls, embs, exclude_centroid=None, link_sim=0.55):
+        """从一批声纹嵌入里找"主要人声"（最大连通簇）：说话最多的人。
+        embs: list[list[float]]；exclude_centroid: 给"我"时先排除与它过近的段，
+        防把用户本人当主声纹。返回 (簇质心, 簇内嵌入, 总段数)；簇空返回 (None, [], n)"""
+        n = len(embs)
+        if n == 0:
+            return None, [], 0
+        M = np.asarray(embs, dtype=np.float32)
+        M = M / (np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
+        keep = np.ones(n, dtype=bool)
+        if exclude_centroid is not None:
+            e = np.asarray(exclude_centroid, dtype=np.float32)
+            e = e / (np.linalg.norm(e) + 1e-9)
+            keep &= (M @ e) < 0.85          # 与"我"几乎同声的段不参与
+        if not keep.any():
+            return None, [], n
+        Mk = M[keep]
+        S = Mk @ Mk.T                        # 余弦相似度矩阵
+        seed = int(np.argmax((S >= link_sim).sum(axis=1)))
+        members = S[seed] >= link_sim
+        centroid = Mk[members].mean(axis=0)
+        centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+        members = (Mk @ centroid) >= link_sim   # 用质心重筛一轮，去掉挂边噪声段
+        if not members.any():
+            return None, [], n
+        centroid = Mk[members].mean(axis=0)
+        centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+        full = np.zeros(n, dtype=bool)
+        full[np.where(keep)[0][members]] = True
+        return centroid.tolist(), [embs[i] for i in np.where(full)[0]], n
+
+    def _absorb(self, name, embs):
+        """把一批嵌入并入已注册声纹的样本池（与手动录入同池，上限 8 条轮转），
+        质心重算。返回并入条数；声纹不存在返回 0"""
+        rec = self.named.get(name)
+        if rec is None or not embs:
+            return 0
+        M = np.asarray(embs, dtype=np.float32)
+        c = np.asarray(rec.get("centroid") or embs[0], dtype=np.float32)
+        cn = c / (np.linalg.norm(c) + 1e-9)
+        Mn = M / (np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
+        order = np.argsort(-(Mn @ cn))       # 离现有质心最近的做代表样本
+        for i in order[:3]:
+            rec["samples"].append(list(map(float, M[i])))
+        rec["samples"] = rec["samples"][-8:]
+        rec["count"] = len(rec["samples"])
+        rec["centroid"] = list(np.mean(np.asarray(rec["samples"]), axis=0))
+        self.manager.add(name, [rec["centroid"]])
+        self._save()
+        return int(len(order[:3]))
+
+    def enroll_dominant(self, name, embs):
+        """反向绑定：从一批嵌入（长音频切段而来）提取主要人声注册/并入声纹。
+        已有该声纹 → 只并入与其质心匹配的段；没有 → 最大簇须占 40% 以上才创建。
+        返回 (认领段数, 总段数, 是否新注册)"""
+        name = (name or "").strip()[:32] or "未命名"
+        if not embs:
+            return 0, 0, False
+        with self.lock:
+            is_new = name not in self.named
+            if not is_new:
+                c = self.named[name].get("centroid")
+                hits = [e for e in embs
+                        if c and self._cos(e, c) >= self.threshold]
+                claimed = self._absorb(name, hits) if len(hits) >= 3 else 0
+                return claimed, len(embs), False
+            centroid, members, total = self._dominant_cluster(
+                embs, exclude_centroid=self.user_centroid)
+            if centroid is None:
+                return 0, total, False
+            if len(members) < 5 or len(members) < 0.4 * total:
+                log("[声纹] 主声纹占比不足（%d/%d 段），不注册 %s"
+                    % (len(members), total, name))
+                return 0, total, False
+            M = np.asarray(members, dtype=np.float32)
+            cn = np.asarray(centroid, dtype=np.float32)
+            cn = cn / (np.linalg.norm(cn) + 1e-9)
+            Mn = M / (np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
+            reps = [list(map(float, M[i]))
+                    for i in np.argsort(-(Mn @ cn))[:8]]   # 离质心最近的 8 条做样本
+            self.named[name] = {"samples": reps, "count": len(reps),
+                                "centroid": list(map(float, centroid))}
+            self.manager.add(name, [self.named[name]["centroid"]])
+            self._save()
+            log("[声纹] 反向绑定：主声纹 %d/%d 段 → 注册 %s" % (len(members), total, name))
+            return len(members), total, True
+
+    def resolve_teachers(self, names):
+        """教务老师名 -> 声纹库注册名（容忍缺「老师」后缀）。
+        解析不到的记日志跳过——本课就不会标成这个人，而不是猜成别的老师"""
+        if not names:
+            return []
+        with self.lock:
+            keys = set(self.named)
+        out = []
+        for t in names:
+            t = (t or "").strip()
+            if not t:
+                continue
+            cand = next((c for c in (t, t + "老师") if c in keys), None)
+            if cand and cand not in out:
+                out.append(cand)
+            elif not cand:
+                log("[声纹] 该老师未注册声纹，本课不标注他:", t)
+        return out
+
+    def label(self, samples, allow=None, collect=False):
         """返回 (说话人名, 相似度)：只匹配已注册声纹（自助录入或"我"），
         匹配不上的一律"未知"——环境碎音不会自动创建新聚类。
+        allow: 允许命中的声纹名集合（上课会话按课程绑定老师传入）；
+        None=全库。候选恒含"我"。others 聚类只在全库模式参与。
+        collect: True 时把本段嵌入存入会话缓存（下课并入本课老师=反向绑定）。
         命中时质心轻微向本次嵌入漂移（EMA 0.08），自适应不同距离/姿态"""
         if not self.enabled:
             return "", 0.0
         emb = self._embed(samples)
         if emb is None:
             return "未知", 0.0
+        if collect:
+            _session_collect_emb(emb)
         with self.lock:
-            if self.manager is not None:
-                name = self.manager.search(emb, self.threshold)
-                if name:
-                    changed = False
-                    if name == "我" and self.user_centroid:
-                        self.user_centroid = [a + 0.08 * (b - a) for a, b in
-                                              zip(self.user_centroid, emb)]
-                        changed = True
-                    elif name in self.named and self.named[name].get("centroid"):
-                        c = self.named[name]["centroid"]
-                        self.named[name]["centroid"] = [a + 0.08 * (b - a) for a, b in
-                                                        zip(c, emb)]
-                        changed = True
-                    if changed:
-                        self._rebuild()
-                        now = time.time()
-                        if now - getattr(self, "_last_save", 0) > 60:
-                            self._last_save = now
-                            self._save()
-                    return name, 1.0
+            cands = []
+            if self.user_centroid:
+                cands.append(("我", self.user_centroid))
+            for name, rec in self.named.items():
+                if (allow is None or name in allow) and rec.get("centroid"):
+                    cands.append((name, rec["centroid"]))
+            if allow is None:
+                for name, c in self.others.items():
+                    cands.append((name, c))
+            best_name, best_sim = "", -1.0
+            for name, c in cands:
+                sim = self._cos(emb, c)
+                if sim > best_sim:
+                    best_name, best_sim = name, sim
+            if best_name and best_sim >= self.threshold:
+                changed = False
+                if best_name == "我":
+                    self.user_centroid = [a + 0.08 * (b - a) for a, b in
+                                          zip(self.user_centroid, emb)]
+                    changed = True
+                elif best_name in self.named and self.named[best_name].get("centroid"):
+                    c = self.named[best_name]["centroid"]
+                    self.named[best_name]["centroid"] = [a + 0.08 * (b - a) for a, b in
+                                                         zip(c, emb)]
+                    changed = True
+                if changed:
+                    self._rebuild()
+                    now = time.time()
+                    if now - getattr(self, "_last_save", 0) > 60:
+                        self._last_save = now
+                        self._save()
+                return best_name, round(best_sim, 3)
             return "未知", 0.0
 
     def enroll_user(self, samples):
@@ -801,7 +926,7 @@ def transcribe_file(path, refiner, punct, denoiser=None, registry=None, log_it=T
                 except Exception:
                     pass
         if t:
-            spk = registry.label(seg) if registry else ("", 0)
+            spk = registry.label(seg, allow=_session_allow()) if registry else ("", 0)
             spk_name = spk[0] if spk and spk[0] else "未知"
             texts.append("[" + spk_name + "] " + t)
             segs.append({"speaker": spk_name, "text": t})
@@ -813,30 +938,78 @@ def transcribe_file(path, refiner, punct, denoiser=None, registry=None, log_it=T
 
 # ---------------- 会话：宿曜上课长录音（启停接口 + 会话总结） ----------------
 
-def session_start(title):
+def _session_allow():
+    """上课会话进行中且绑定了老师 → 返回允许命中的声纹名集合（label 内恒含"我"）；
+    否则 None=全库匹配。跨线程只读 dict，GIL 下安全"""
+    if SESSION["active"] and SESSION.get("teachers"):
+        return set(SESSION["teachers"])
+    return None
+
+
+def _session_collect_emb(emb):
+    """会话进行中收集该段声纹嵌入（finalize 线程调，list.append GIL 原子）。
+    下课 session_stop 时取最大簇反向绑定本课老师"""
+    if SESSION["active"]:
+        buf = SESSION.setdefault("spk_embs", [])
+        if len(buf) < 2000:
+            buf.append(list(emb))
+
+
+def merge_session_speakers(registry):
+    """下课反向绑定：把会话攒下的段嵌入并入本课老师声纹。
+    老师已有声纹 → 并入与其质心匹配的段（整节课真实声学，比 5 秒录入稳）；
+    老师没声纹 → 最大簇（占比≥40% 且 ≥5 段）自动注册为主讲老师"""
+    embs = SESSION.get("spk_embs") or []
+    teachers = list(SESSION.get("teachers") or [])
+    SESSION["spk_embs"] = []
+    if not registry or not registry.enabled or not embs or not teachers:
+        return
+    for t in teachers:
+        claimed, total, is_new = registry.enroll_dominant(t, embs)
+        if claimed or is_new:
+            log("[会话] 反向绑定 %s：%s（段 %d/%d）"
+                % (t, "新注册" if is_new else "并入样本", claimed, total))
+
+
+def session_start(title, teachers=None, course_teachers=None, registry=None):
     """开启一个会话：此后所有落日志的语音（ambient/上屏/转写）同步写入
-    sessions/session-<时间戳>.md，标题写在文件首行。返回会话信息 dict"""
+    sessions/session-<时间戳>.md，标题写在文件首行。
+    teachers: 本课老师名（教务口径，可带「老师」后缀）——解析到已注册声纹的
+    会在本会话内作为唯一候选（加"我"），杜绝跨课老师/学生误命中；
+    解析后为空时用 course_teachers（课程名子串→老师名）按标题兜底。
+    registry: 声纹注册表实例（serve 局部创建，HTTP 层显式传入）。
+    返回会话信息 dict"""
     with SESSION_LOCK:
         if SESSION["active"]:
             raise RuntimeError("已有会话进行中: " + SESSION["title"])
+        bound = registry.resolve_teachers(teachers) if registry else []
+        if not bound and course_teachers and title:
+            hit = max((k for k in course_teachers if k and k in title),
+                      key=len, default=None)
+            if hit:
+                bound = registry.resolve_teachers(course_teachers[hit]) if registry else []
         SESSION.update({"active": True, "title": (title or "").strip()[:60] or "未命名",
                         "stamp": time.strftime("%Y%m%d-%H%M%S"),
                         "start": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "lines": 0, "parts": []})
+                        "lines": 0, "parts": [], "teachers": bound, "spk_embs": []})
         os.makedirs(SESSIONS_DIR, exist_ok=True)
         _session_append("# 会话转录：" + SESSION["title"] +
                         "\n\n开始：" + SESSION["start"] + "\n\n")
-        log("[会话] 开始:", SESSION["title"], "->", "session-" + SESSION["stamp"] + ".md")
+        log("[会话] 开始:", SESSION["title"], "->", "session-" + SESSION["stamp"] + ".md",
+            ("（声纹绑定: " + "、".join(bound) + "）") if bound else "（无声纹绑定，全库匹配）")
         return session_status()
 
 
-def session_stop(cfg=None, summarize=False):
-    """结束会话。summarize=True 时由 HTTP 层再调 session_summarize 提炼要点"""
+def session_stop(cfg=None, summarize=False, registry=None):
+    """结束会话。summarize=True 时由 HTTP 层再调 session_summarize 提炼要点。
+    结束前把会话攒下的段嵌入反向绑定给本课老师（merge_session_speakers）"""
     with SESSION_LOCK:
         if not SESSION["active"]:
             raise RuntimeError("没有进行中的会话")
         title, lines = SESSION["title"], SESSION["lines"]
+        merge_session_speakers(registry)   # 先反向绑定（要用 teachers/spk_embs）
         SESSION["active"] = False
+        SESSION["teachers"] = []
         _session_append("\n结束：" + time.strftime("%Y-%m-%d %H:%M:%S") +
                         " · 共 " + str(lines) + " 条\n")
         parts = list(SESSION.get("parts") or [])
@@ -948,6 +1121,7 @@ def deepseek_summarize(cfg, range_label, transcript, mode="full"):
 def session_status():
     return {"active": SESSION["active"], "title": SESSION["title"],
             "start": SESSION["start"], "lines": SESSION["lines"],
+            "teachers": list(SESSION.get("teachers") or []),
             "file": ("session-" + SESSION["stamp"] + ".md") if SESSION["active"] else ""}
 
 
@@ -1284,13 +1458,19 @@ PAGE_HTML = """<!doctype html>
   <button onclick="svPost('/api/who','who',this)">文件判断</button>
   <span id="who-out" class="meta"></span>
  </div>
+ <div style="margin-top:6px;font-size:13px">
+  反向绑定（整节课录音里说话最多的人=主讲）：
+  <input id="dom-path" placeholder="录音绝对路径 wav/mp3/m4a" style="width:250px;background:#141416;color:#e8eaed;border:1px solid #3c4043;border-radius:4px;padding:3px 6px">
+  <button onclick="svPost('/api/enroll_dominant','dom',this)">提取主声纹并注册</button>
+  <span id="dom-out" class="meta"></span>
+ </div>
  <div id="spk-list" class="meta" style="margin-top:8px"></div>
 </div>
 <div class="api">
  API：<code>GET /api/history?limit=100&amp;since_id=0</code> ·
  <code>GET /api/status</code> · <code>GET /api/summary?date=YYYY-MM-DD</code> ·
- <code>POST /api/mode /api/clear /api/summarize /api/transcribe</code> ·
- <code>POST /api/session/start</code>{"title"} · <code>POST /api/session/stop</code>{"summarize":true} ·
+ <code>POST /api/mode /api/clear /api/summarize /api/transcribe /api/enroll_dominant</code>{"path","name"长音频主声纹反向绑定} ·
+ <code>POST /api/session/start</code>{"title","teachers"?:[老师名]绑定本课声纹} · <code>POST /api/session/stop</code>{"summarize":true} ·
  <code>GET /api/sessions</code>
  （仅本机 127.0.0.1 可访问；配置 api_token 后 POST 需带 X-Token 头）
 </div>
@@ -1313,14 +1493,16 @@ async function svLive(url, outId){
 }
 async function svPost(url, outId, btn){
   const out = document.getElementById(outId + '-out');
-  out.textContent = '处理中…';
+  out.textContent = '处理中…（长音频需先切段提声纹，可能要几十秒）';
   const body = {};
   if(outId === 'en'){ body.name = document.getElementById('en-name').value; body.path = document.getElementById('en-path').value; }
+  else if(outId === 'dom'){ body.name = document.getElementById('en-name').value; body.path = document.getElementById('dom-path').value; }
   else { body.path = document.getElementById('who-path').value; }
   try{
     const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
     const d = await r.json();
     if(url === '/api/enroll'){ out.textContent = d.ok ? ('已注册 '+d.name+'（样本 '+d.samples+' 条）') : ('失败: '+(d.error||'未知')); }
+    else if(url === '/api/enroll_dominant'){ out.textContent = d.ok ? ((d.new?'已注册':'已并入')+' '+d.name+'（主声纹段 '+d.claimed+'/'+d.segments+'）') : ('失败: '+(d.error||'未知')); }
     else{
       const top = Object.entries(d.scores||{}).sort((a,b)=>b[1]-a[1]).slice(0,3)
         .map(([k,v])=>k+' '+v).join('，');
@@ -1500,6 +1682,57 @@ class HistoryServer:
                                          "samples": count, "new": is_new})
                     except Exception as exc:
                         self._json(500, {"ok": False, "error": str(exc)})
+                elif u.path == "/api/enroll_dominant":
+                    """反向绑定：长录音（整节课 wav/mp3）→ VAD 切段 → 嵌入 →
+                    最大簇=主讲人 → 注册/并入指定老师声纹"""
+                    try:
+                        p = safe_media_path(payload.get("path", ""))
+                    except ValueError as exc:
+                        self._json(400, {"ok": False, "error": str(exc)})
+                        return
+                    name = str(payload.get("name", "")).strip()
+                    if not name:
+                        self._json(400, {"ok": False, "error": "name required"})
+                        return
+                    if not (registry and registry.enabled):
+                        self._json(400, {"ok": False, "error": "声纹识别未启用"})
+                        return
+                    try:
+                        src, cleanup = _ensure_wav(p)
+                        try:
+                            data = _read_wav_mono16k(src)
+                        finally:
+                            if cleanup:
+                                try:
+                                    os.remove(cleanup)
+                                except OSError:
+                                    pass
+                        chunks = _vad_split(data, vad_cfg) if vad_cfg is not None else []
+                        if not chunks:
+                            chunks = [np.asarray(data, dtype=np.float32)]
+                        # 二级切分：超长段（老师连讲数分钟）按 8s 固定窗切开，
+                        # 每个嵌入只代表单一说话时段，避免跨人混合
+                        WIN = SAMPLE_RATE * 8
+                        pieces = []
+                        for c in chunks:
+                            c = np.asarray(c, dtype=np.float32)
+                            if len(c) <= WIN * 1.5:
+                                pieces.append(c)
+                                continue
+                            for i in range(0, len(c) - SAMPLE_RATE, WIN):
+                                piece = c[i:i + WIN]
+                                if len(piece) >= SAMPLE_RATE * 2:
+                                    pieces.append(piece)
+                        pieces = [p for p in pieces if len(p) > SAMPLE_RATE]
+                        embs = [e for e in map(registry._embed, pieces) if e is not None]
+                        claimed, total, is_new = registry.enroll_dominant(name, embs)
+                        ok = is_new or claimed > 0
+                        self._json(200, {"ok": ok, "name": name, "new": is_new,
+                                         "claimed": claimed, "segments": total,
+                                         "error": "" if ok else
+                                         "主声纹占比不足或无匹配段（共 %d 段）" % total})
+                    except Exception as exc:
+                        self._json(500, {"ok": False, "error": str(exc)})
                 elif u.path == "/api/who":
                     try:
                         p = safe_media_path(payload.get("path", ""))
@@ -1600,13 +1833,16 @@ class HistoryServer:
                         self._json(500, {"ok": False, "error": str(exc)})
                 elif u.path == "/api/session/start":
                     try:
-                        info = session_start(payload.get("title", ""))
+                        info = session_start(payload.get("title", ""),
+                                             teachers=payload.get("teachers"),
+                                             course_teachers=cfg.get("course_teachers"),
+                                             registry=registry)
                         self._json(200, {"ok": True, **info})
                     except RuntimeError as exc:
                         self._json(409, {"ok": False, "error": str(exc)})
                 elif u.path == "/api/session/stop":
                     try:
-                        info = session_stop(cfg)
+                        info = session_stop(cfg, registry=registry)
                         summary = ""
                         if payload.get("summarize") and cfg.get("deepseek_api_key"):
                             summary = session_summarize(cfg)
@@ -1726,7 +1962,7 @@ def main():
                 pending.update(samples=0, text="", updated=0.0)
                 return
             audio = pending["blocks"][0]
-            spk = registry.label(audio)
+            spk = registry.label(audio, allow=_session_allow(), collect=True)
             speaker = spk[0] if spk and spk[0] else "未知"
             if allowlist_only and speaker == "未知":
                 state["stats"]["unknown_dropped"] += 1
@@ -1850,7 +2086,7 @@ def main():
             text, refined = refine_block(block)
             if not text:
                 text = stream_text
-            spk = registry.label(block)
+            spk = registry.label(block, allow=_session_allow())
             speaker = spk[0] if spk and spk[0] else "未知"
             if text:
                 voice_log(text, committed=True, speaker=speaker)
