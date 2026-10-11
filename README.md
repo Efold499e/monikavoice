@@ -111,7 +111,7 @@ Windows 离线中文语音听写与环境记录工具：常态录音自动过滤
    ```
 
 3. 启动：`pythonw monikavoice.py`（无窗口后台运行），或双击 `start_monikavoice.bat`；
-   开机自启把 `start_monikavoice_autostart.bat` 的快捷方式放进 `shell:startup`。
+   开机自启在 `shell:startup\monikavoice.lnk`（直接指向 pythonw + 脚本参数）。
 
 ## 使用
 

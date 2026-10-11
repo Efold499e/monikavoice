@@ -54,7 +54,7 @@ HOTKEY_TOGGLE, HOTKEY_QUIT = 1, 2
 SAMPLE_RATE = 16000
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 MODEL_DIR = os.path.join(BASE, "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20")
 PUNCT_DIR = os.path.join(BASE, "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12")
 PARAFORMER_DIR = os.path.join(BASE, "sherpa-onnx-paraformer-zh-2023-09-14")
@@ -116,11 +116,12 @@ DEFAULT_CONFIG = {
     "speaker_enable": True,
     "speaker_threshold": 0.5,
     "auto_enroll_user": False,  # 上屏语音是否自动注册"我"（默认关，避免录错人；手动录入更可控）
-    "end_silence_s": 0.4,       # 断句静音时长；ambient 未完句会自动合并，此值只影响断句粒度与上屏延迟
+    "end_silence_s": 0.6,       # 断句静音时长；ambient 未完句会自动合并，此值只影响断句粒度与上屏延迟
     "vad_enable": True,         # Silero VAD 人声门控：非人声段不精修、不落日志
     "vad_speech_ratio": 0.25,   # 段内人声窗口占比低于此值判定为环境噪音
     "merge_max_seconds": 45.0,  # ambient 未完句最长持有音频（超时强制落盘）
     "merge_gap_seconds": 12.0,  # ambient 静音超过该秒数，未完句先落盘
+    "terminal_hold_s": 6.0,     # 句末标点观察期：期间有新语音就继续合并，防止思考停顿切句
     "speaker_allowlist_only": False,  # True 时 ambient 只保留命中已注册声纹的句子
     "course_teachers": {},  # 课程名子串 -> [老师名]：会话没显式传 teachers 时按标题兜底绑定声纹
 }
@@ -337,8 +338,8 @@ def build_recognizer(cfg):
         feature_dim=80,
         decoding_method="modified_beam_search",
         enable_endpoint_detection=True,
-        rule2_min_trailing_silence=float(cfg.get("end_silence_s", 0.4)),
-        rule3_min_utterance_length=20.0,
+        rule2_min_trailing_silence=float(cfg.get("end_silence_s", 0.6)),
+        rule3_min_utterance_length=30.0,
     )
 
 
@@ -1945,21 +1946,26 @@ def main():
 
     def finalize_worker():
         """ambient 断句段的精修/合并/落盘专用线程：
-        VAD 门槛 → 未完句合并整段重精修 → 出现终结标点才落日志。
+        VAD 门槛 → 未完句合并整段重精修 → 句末标点 + 观察期无人接话才落日志。
+        标点模型对"听着完整的从句"也会补句号，若一出现句号就落盘，思考停顿处
+        会被误切；因此句末标点后进入 terminal_hold_s 观察期，期间有新段到来就
+        合并重精修（句子续上），真没人说了才落盘。
         独立成线程后，停顿处写日志（重精修可达 1-2 秒）期间 dictation 线程的
         流式解码照常跑，新输入不会被卡住；写日志顺序与断句顺序一致（单线程消费）"""
         merge_gap_s = float(cfg.get("merge_gap_seconds", 12.0))
         merge_max_s = float(cfg.get("merge_max_seconds", 45.0))
+        terminal_hold_s = float(cfg.get("terminal_hold_s", 3.0))
         vad_ratio_min = float(cfg.get("vad_speech_ratio", 0.25))
         allowlist_only = bool(cfg.get("speaker_allowlist_only", False))
-        # 未完句持有状态：blocks[0]=已合并音频，text=最近一次精修+标点结果
-        pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0}
+        # 未完句持有状态：blocks[0]=已合并音频，text=最近一次精修+标点结果，
+        # terminal=文本以句末标点收尾（进入观察期）
+        pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0, "terminal": False}
 
         def pending_flush():
             """把持有中的未完句落日志（用最近一次合并精修的文本，不再重算）"""
             nonlocal pending
             if not pending["blocks"]:
-                pending.update(samples=0, text="", updated=0.0)
+                pending.update(samples=0, text="", updated=0.0, terminal=False)
                 return
             audio = pending["blocks"][0]
             spk = registry.label(audio, allow=_session_allow(), collect=True)
@@ -1971,15 +1977,22 @@ def main():
                 voice_log(pending["text"], committed=False, speaker=speaker)
                 history.add("ambient", pending["text"], committed=False,
                             refined=True, speaker=speaker)
-            pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0}
+            pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0,
+                       "terminal": False}
 
         while True:
             try:
                 job = finalize_q.get(timeout=0.5)
             except queue.Empty:
-                # 静默期：未完句超过 merge_gap 秒先落盘，避免一直挂起
-                if pending["samples"] and time.time() - pending["updated"] > merge_gap_s:
-                    pending_flush()
+                # 观察期/静默期落盘：句末标点只等 terminal_hold_s；无句末标点的
+                # 未完句等 merge_gap_s（说话间隙的犹豫停顿不至于切句）
+                if pending["samples"]:
+                    idle = time.time() - pending["updated"]
+                    if pending["terminal"]:
+                        if idle > terminal_hold_s:
+                            pending_flush()
+                    elif idle > merge_gap_s:
+                        pending_flush()
                 continue
             if job == "FLUSH":
                 pending_flush()
@@ -1994,7 +2007,8 @@ def main():
                 # 持有中的未完句已到上限：先落盘，避免合并音频无限增长
                 if pending["blocks"] and pending["samples"] >= merge_max_s * SAMPLE_RATE:
                     pending_flush()
-                # 与持有中的未完句合并后整段重精修（纠正跨段切分造成的同音错字）
+                # 与持有中的未完句合并后整段重精修（纠正跨段切分造成的同音错字）；
+                # 哪怕上一段已带句末标点，只要还在观察期内就合并，句子续上
                 audio = np.concatenate(pending["blocks"] + [block]) if pending["blocks"] else block
                 text, refined = refine_block(audio)
                 if not text and pending["text"]:
@@ -2004,9 +2018,10 @@ def main():
                 if not text:
                     continue
                 pending = {"blocks": [audio], "samples": len(audio),
-                           "text": text, "updated": time.time()}
-                # 出现句末标点（或音频超长）才落日志；半句继续持有等下一段合并
-                if TERMINAL_RE.search(text) or pending["samples"] >= merge_max_s * SAMPLE_RATE:
+                           "text": text, "updated": time.time(),
+                           "terminal": bool(TERMINAL_RE.search(text))}
+                # 只有音频超长才立即落盘；句末标点交给观察期判断
+                if pending["samples"] >= merge_max_s * SAMPLE_RATE:
                     pending_flush()
             except Exception as exc:
                 log("[ambient 落盘异常]", exc)
