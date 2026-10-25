@@ -16,6 +16,7 @@ Windows 离线中文语音听写与环境记录工具：常态录音自动过滤
 - **声纹识别**：逐句标注说话人来源，可选 `speaker_allowlist_only` 白名单模式（只保留已注册说话人）；自助录入/管理走网页表单
 - **人声增强**：GT-CRN 降噪模型接入精修与转写路径，嘈杂环境的人声更干净、识别更准
 - **上课/长录音会话**（宿曜适配）：`/api/session/start` 开启后，所有落日志的语音同步写入 `sessions/session-<时间戳>.md`，结束后可一键 DeepSeek 提炼要点追加到文末；`/api/transcribe` 支持数小时录音文件（VAD 按人声切分，非 wav 格式自动 ffmpeg 转换）
+- **声音反馈**：上课/专注时不看屏幕也能确认状态——启动就绪上行双音、切上屏高音一声、切记录低音一声、每落一句一声极短轻响、异常三连低音、退出下行双音；麦克风回调停摆自动重建并报警，全零静音（设备被禁用/静音）超 1 分钟开始提醒，彻底消灭"死了一声不吭"
 - **历史记录**：全部识别内容（含未上屏部分）持久化到 `history.jsonl`，内置网页查看页，并提供本机 HTTP API 供其他程序调用
 
 ## 工作原理
@@ -48,6 +49,9 @@ Windows 离线中文语音听写与环境记录工具：常态录音自动过滤
 - 断句静音、VAD 阈值、合并超时等参数集中在 `monikavoice.py` 顶部 `DEFAULT_CONFIG`，
   可在 `config.json` 里覆盖（`end_silence_s` / `vad_enable` / `vad_speech_ratio` /
   `merge_max_seconds` / `merge_gap_seconds` / `speaker_allowlist_only`）。
+- 声音反馈可在 `config.json` 调整：`beep_enable`（总开关）、`beep_volume`（0~1 音量）、
+  `beep_on_capture`（落句轻响开关，嫌吵可关）、`mic_watchdog`（看门狗开关）。
+  提示音只发生在离散事件上且避开说话段，过不了 VAD 人声门槛，不会被记进日志。
 
 ## 基于的开源项目
 

@@ -35,3 +35,6 @@ silero_vad.onnx
 
 # 会话转录（宿曜上课长录音）
 sessions/
+
+# 含内部服务token的转发配置，仅本机留存
+classlog_forward.json

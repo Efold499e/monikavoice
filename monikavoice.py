@@ -14,6 +14,9 @@ monikavoice —— Windows 离线中文语音听写（本地运行，无广告�
   /api/mode /api/transcribe /api/session（宿曜上课长录音会话）等接口供 AI/程序调用
 - 每日任务：02:00 用 DeepSeek 总结前一天 02:01 起的全部内容到 summaries/；
   同时清理 6 个月前的历史与日志
+- 声音反馈：启动/模式切换/落句轻响/异常报警（上课不看屏幕也能确认状态）；
+  麦克风回调停摆自动重建并报警，全零静音（设备被禁用/静音）定时提醒，
+  彻底消灭"死了一声不吭"
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -54,7 +57,7 @@ HOTKEY_TOGGLE, HOTKEY_QUIT = 1, 2
 SAMPLE_RATE = 16000
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 MODEL_DIR = os.path.join(BASE, "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20")
 PUNCT_DIR = os.path.join(BASE, "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12")
 PARAFORMER_DIR = os.path.join(BASE, "sherpa-onnx-paraformer-zh-2023-09-14")
@@ -123,6 +126,10 @@ DEFAULT_CONFIG = {
     "merge_gap_seconds": 12.0,  # ambient 静音超过该秒数，未完句先落盘
     "terminal_hold_s": 6.0,     # 句末标点观察期：期间有新语音就继续合并，防止思考停顿切句
     "speaker_allowlist_only": False,  # True 时 ambient 只保留命中已注册声纹的句子
+    "beep_enable": True,        # 事件提示音（启动/模式切换/异常）：上课不看屏幕也能确认状态
+    "beep_volume": 0.3,         # 提示音音量 0~1（正弦软音，非刺耳系统蜂鸣）
+    "beep_on_capture": True,    # 每落一句日志/上屏播一声极短轻响，确认"确实在录"
+    "mic_watchdog": True,       # 麦克风回调停摆自动重建；全零静音（被禁用/静音）定时报警
     "course_teachers": {},  # 课程名子串 -> [老师名]：会话没显式传 teachers 时按标题兜底绑定声纹
 }
 
@@ -146,6 +153,35 @@ def log(*args):
         pass
 
 
+# ---- 课程记录转发：已上屏文本实时推到 NanoPi（失败静默，不阻塞语音主流程）----
+CLASSLOG_CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "classlog_forward.json")
+
+
+def _classlog_forward(text, speaker):
+    def _post():
+        try:
+            with open(CLASSLOG_CFG_PATH, encoding="utf-8") as f:
+                cfg = json.load(f)
+            if not cfg.get("enable"):
+                return
+            url = cfg.get("url", "")
+            host = url.split("//", 1)[-1].split(":", 1)[0].split("/", 1)[0]
+            if host != cfg.get("host_ok", ""):
+                log("classlog 目标不在白名单:", host)
+                return
+            import urllib.request
+            payload = json.dumps({"text": text, "speaker": speaker,
+                                  "day": time.strftime("%Y-%m-%d"),
+                                  "t": time.strftime("%H:%M:%S")}).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("X-Token", cfg.get("token", ""))
+            urllib.request.urlopen(req, timeout=5).read()
+        except Exception as exc:
+            log("classlog 转发失败:", exc)
+    threading.Thread(target=_post, daemon=True).start()
+
+
 def voice_log(text, committed, speaker=""):
     """语音内容按天落盘：logs/voice-YYYY-MM-DD.log
     每行 [时间] [说话人] 标记 文本。会话（上课录音）开启时同步写入会话转录"""
@@ -167,6 +203,11 @@ def voice_log(text, committed, speaker=""):
             SESSION["parts"].append(text)
         except OSError as exc:
             log("会话转录写入失败:", exc)
+    if committed:
+        try:
+            _classlog_forward(text, speaker)
+        except Exception as exc:
+            log("classlog 转发异常:", exc)
 
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -1308,13 +1349,69 @@ def catchup_worker(cfg, store):
 
 # ---------------- 浮窗 ----------------
 
+# ---------------- 声音反馈（上课/专注时不看屏幕也能确认状态） ----------------
+# 只在离散事件上响，最长 0.4s 且避开说话段；落句轻响在断句静音处播放，
+# 即使被麦克风拾到也只是一小段噪音，过不了 VAD 人声门槛，不会进日志
+SOUND_DEFS = {
+    "ready":   [(880, 0.09, 1.0), (1318, 0.14, 1.0)],   # 启动就绪/麦克风恢复：上行双音
+    "commit":  [(1318, 0.11, 1.0)],                     # 切上屏模式：高音一声
+    "ambient": [(740, 0.11, 1.0)],                      # 切记录模式：低音一声
+    "capture": [(1568, 0.05, 0.5)],                     # 一句已落日志/上屏：极短轻响
+    "error":   [(440, 0.16, 1.0)] * 3,                  # 麦克风/识别异常：三连低音
+    "quit":    [(880, 0.10, 1.0), (587, 0.16, 1.0)],    # 退出：下行双音
+}
+
+
+def _beep_tone(freq, dur, amp):
+    """正弦单音，首尾 4ms 淡入淡出防爆音"""
+    n = int(SAMPLE_RATE * dur)
+    t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
+    w = np.sin(2 * np.pi * freq * t).astype(np.float32) * amp
+    fade = max(1, min(n // 4, int(SAMPLE_RATE * 0.004)))
+    w[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+    w[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+    return w
+
+
+class Beeper:
+    """事件提示音：正弦软音走默认输出设备（sounddevice），异步播放不卡 UI"""
+
+    def __init__(self, cfg):
+        self.enabled = bool(cfg.get("beep_enable", True))
+        self.volume = float(cfg.get("beep_volume", 0.3))
+        self.capture_on = bool(cfg.get("beep_on_capture", True))
+        self._cache = {}
+        self._fail = 0
+
+    def play(self, name):
+        # 连续失败 3 次自动静默（无声卡/输出设备被禁用时不拖累主流程）
+        if not self.enabled or self._fail >= 3:
+            return
+        if name == "capture" and not self.capture_on:
+            return
+        try:
+            wave = self._cache.get(name)
+            if wave is None:
+                wave = np.concatenate([
+                    np.concatenate([_beep_tone(f, d, self.volume * a),
+                                    np.zeros(int(SAMPLE_RATE * 0.02), dtype=np.float32)])
+                    for f, d, a in SOUND_DEFS[name]])
+                self._cache[name] = wave
+            sd.play(wave, SAMPLE_RATE)
+        except Exception as exc:
+            self._fail += 1
+            log("[提示音]", name, "播放失败:", exc,
+                "（再失败", 3 - self._fail, "次将关闭）" if self._fail < 3 else "（已关闭提示音）")
+
+
 class FloatWindow:
     """上屏模式弹出的置顶小浮窗：实时显示识别内容，不抢目标应用焦点"""
 
-    def __init__(self, ui_q, state, audio_q):
+    def __init__(self, ui_q, state, audio_q, beeper=None):
         self.q = ui_q
         self.state = state
         self.audio_q = audio_q
+        self.beeper = beeper
         self.hotkey_name = "…"
         self.last_partial = ""
         self.tray = None
@@ -1363,6 +1460,8 @@ class FloatWindow:
                     self.refresh_header()
                 elif cmd == "quit":
                     # 停止前让识别线程把未上屏内容截断上 log，约 1 秒后退出
+                    if self.beeper:
+                        self.beeper.play("quit")
                     self.state["flush"].set()
                     self.root.after(1000, self.root.destroy)
                     return
@@ -1389,6 +1488,8 @@ class FloatWindow:
         else:
             self.root.withdraw()
             log("[模式] 记录（不上屏）")
+        if self.beeper:
+            self.beeper.play(mode)  # 上屏=高音一声，记录=低音一声
         self.update_tray_title()
 
     def update_tray_title(self):
@@ -1932,7 +2033,15 @@ def main():
                     log("[标点异常]", exc)
         return text, refined
 
+    micmon = {"last_ts": time.time(), "zero_since": None,
+              "dead_ann": 0.0, "zero_ann": 0.0, "zero_announced": False}
+
     def mic_callback(indata, frames, time_info, status):
+        micmon["last_ts"] = time.time()
+        if indata.any():
+            micmon["zero_since"] = None
+        elif micmon["zero_since"] is None:
+            micmon["zero_since"] = time.time()
         audio_q.put(indata.copy())
         if capture["active"]:
             capture["buf"].append(indata.copy())
@@ -1940,9 +2049,70 @@ def main():
                 capture["active"] = False
                 capture["done"].set()
 
-    mic = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                         blocksize=SAMPLE_RATE // 10, callback=mic_callback)
-    mic.start()
+    def open_mic():
+        m = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                           blocksize=SAMPLE_RATE // 10, callback=mic_callback)
+        m.start()
+        return m
+
+    beeper = Beeper(cfg)
+    try:
+        mic = open_mic()
+        beeper.play("ready")  # 启动就绪：上课不看屏幕也能确认已在监听
+        log("麦克风已打开")
+    except Exception as exc:
+        mic = None  # 看门狗线程会自动重试（如设备稍后才就绪）
+        log("[麦克风] 打开失败，交由看门狗自动重试:", exc)
+        beeper.play("error")
+
+    def mic_watchdog():
+        """专治"死了一声不吭"：回调停摆（设备被拔/驱动挂）自动重建并三连低音报警；
+        全零静音（设备在采集但系统里被禁用/静音）超 1 分钟开始提醒。
+        报警同一问题 10 分钟最多响一次，不吵人"""
+        nonlocal mic
+        while True:
+            time.sleep(5)
+            try:
+                now = time.time()
+                if mic is None or now - micmon["last_ts"] > 10:
+                    if now - micmon["dead_ann"] > 600:
+                        micmon["dead_ann"] = now
+                        beeper.play("error")
+                        log("[看门狗] 麦克风回调停摆，尝试重建")
+                    if mic is not None:
+                        try:
+                            mic.stop()
+                        except Exception:
+                            pass
+                        try:
+                            mic.close()
+                        except Exception:
+                            pass
+                    try:
+                        mic = open_mic()
+                        micmon["last_ts"] = time.time()
+                        micmon["zero_since"] = None
+                        micmon["zero_announced"] = False
+                        beeper.play("ready")
+                        log("[看门狗] 麦克风已重建")
+                    except Exception as exc:
+                        mic = None
+                        log("[看门狗] 麦克风重建失败:", exc)
+                    continue
+                if micmon["zero_since"] and now - micmon["zero_since"] > 60:
+                    if not micmon["zero_announced"] or now - micmon["zero_ann"] > 600:
+                        micmon["zero_ann"] = now
+                        micmon["zero_announced"] = True
+                        beeper.play("error")
+                        log("[看门狗] 麦克风持续全零静音（可能被系统禁用/静音）")
+                elif not micmon["zero_since"] and micmon["zero_announced"]:
+                    micmon["zero_announced"] = False
+                    log("[看门狗] 麦克风恢复正常输入")
+            except Exception as exc:
+                log("[看门狗异常]", exc)
+
+    if cfg.get("mic_watchdog", True):
+        threading.Thread(target=mic_watchdog, daemon=True).start()
 
     def finalize_worker():
         """ambient 断句段的精修/合并/落盘专用线程：
@@ -1977,6 +2147,7 @@ def main():
                 voice_log(pending["text"], committed=False, speaker=speaker)
                 history.add("ambient", pending["text"], committed=False,
                             refined=True, speaker=speaker)
+                beeper.play("capture")  # 轻响=这句确实记下来了
             pending = {"blocks": [], "samples": 0, "text": "", "updated": 0.0,
                        "terminal": False}
 
@@ -2030,6 +2201,7 @@ def main():
     def dictation():
         s = recognizer.create_stream()
         last_partial = ""
+        err_beep_ts = 0.0  # 识别异常报警限频：同一故障连续刷屏时 2 分钟只响一次
         buf, buf_samples = [], 0  # 距上次断句的原始音频，供精修
         vad_carry = []            # 不足一个 VAD 窗口的余样
         seg_speech_windows = 0    # 当前段内检出人声的窗口数
@@ -2108,6 +2280,7 @@ def main():
                 history.add("final", text, committed=True, refined=refined, speaker=speaker)
                 ui_q.put(("final", text))
                 send_text(text)
+                beeper.play("capture")
             # 上屏语音是否自动注册"我"（auto_enroll_user 开启时）
             if cfg.get("auto_enroll_user", False):
                 registry.enroll_user(block)
@@ -2142,6 +2315,9 @@ def main():
                         ambient_finalize(partial)
             except Exception as exc:
                 log("[识别/上屏异常]", exc)
+                if time.time() - err_beep_ts > 120:
+                    err_beep_ts = time.time()
+                    beeper.play("error")
                 time.sleep(0.1)
                 try:
                     recognizer.reset(s)
@@ -2162,9 +2338,12 @@ def main():
         if not name:
             log("所有备选热键均被占用，只能用托盘图标/接口切换模式")
         hotkeys["name"] = name
-        if not user32.RegisterHotKey(None, HOTKEY_QUIT, MOD_CONTROL | MOD_ALT, VK_Q):
+        ok_quit = user32.RegisterHotKey(None, HOTKEY_QUIT, MOD_CONTROL | MOD_ALT, VK_Q)
+        if not ok_quit:
             log("热键注册失败（被占用）: Ctrl+Alt+Q，可用托盘右键退出")
-        log("开关热键:", name or "无", "| 退出热键: Ctrl+Alt+Q")
+        if not name or not ok_quit:
+            beeper.play("error")  # 热键不全时不看日志也该知道
+        log("开关热键:", name or "无", "| 退出热键: Ctrl+Alt+Q" if ok_quit else "| 退出热键: 无")
         ui_q.put(("hotkey", name))
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -2200,7 +2379,7 @@ def main():
     )
     tray.run_detached()
 
-    win = FloatWindow(ui_q, state, audio_q)
+    win = FloatWindow(ui_q, state, audio_q, beeper)
     win.tray = tray
 
     threading.Thread(target=catchup_worker, args=(cfg, history), daemon=True).start()
